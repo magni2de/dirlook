@@ -1,7 +1,7 @@
 # dirlook
 
 > A fast, zero-dependency terminal disk usage analyzer with a tree view and a
-> WinDirStat-style treemap.
+> treemap, written in Rust.
 
 ![dirlook](screenshots/main.png)
 
@@ -9,10 +9,28 @@
 
 - a **tree** of folders and files with their sizes, and
 - a **treemap** (a "data map") where every block's area is proportional to its
-  size and colored by file type — just like WinDirStat.
+  size and colored by file type.
 
 No external crates and no config files: it is a single self-contained binary built
 on the Rust standard library plus a small amount of POSIX FFI.
+
+## Quick start
+
+```sh
+# clone and build
+git clone https://github.com/magni2de/dirlook
+cd dirlook
+cargo build --release
+
+# run it on a directory (defaults to the current directory)
+./target/release/dirlook ~/Downloads
+```
+
+During development you can build and run in one step:
+
+```sh
+cargo run --release -- ~/Downloads
+```
 
 ## Features
 

@@ -77,7 +77,7 @@ pub fn hsl_to_rgb(h: f64, s: f64, l: f64) -> (u8, u8, u8) {
     (to(r1), to(g1), to(b1))
 }
 
-/// WinDirStat-style palette: directories a fixed color, files by extension.
+/// Palette by file type: directories a fixed color, files by extension.
 pub fn ext_color(name: &str, is_dir: bool) -> (u8, u8, u8) {
     if is_dir {
         return DIR_COLOR;
