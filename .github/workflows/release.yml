@@ -9,18 +9,31 @@ permissions:
   contents: write
 
 jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Remove existing release for this tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release delete "${GITHUB_REF_NAME}" --yes || true
+
   build:
+    needs: cleanup
     strategy:
       fail-fast: false
       matrix:
         include:
           - target: aarch64-apple-darwin
+            label: macos-arm64
             os: macos-14
           - target: x86_64-apple-darwin
+            label: macos-x86_64
             os: macos-14
-          - target: x86_64-unknown-linux-gnu
+          - target: x86_64-unknown-linux-musl
+            label: linux-x86_64
             os: ubuntu-latest
-          - target: aarch64-unknown-linux-gnu
+          - target: aarch64-unknown-linux-musl
+            label: linux-arm64
             os: ubuntu-24.04-arm
     runs-on: ${{ matrix.os }}
     steps:
@@ -34,7 +47,7 @@ jobs:
         shell: bash
         run: |
           tag="${GITHUB_REF_NAME}"
-          name="dirlook-${tag}-${{ matrix.target }}"
+          name="dirlook-${tag}-${{ matrix.label }}"
           mkdir -p "dist/${name}"
           cp "target/${{ matrix.target }}/release/dirlook" "dist/${name}/"
           (cd dist && tar czf "${name}.tar.gz" "${name}")
