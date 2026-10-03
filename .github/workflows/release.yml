@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 jobs:
-  upload-assets:
+  build:
     strategy:
       fail-fast: false
       matrix:
@@ -25,9 +25,19 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: taiki-e/upload-rust-binary-action@v1
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          bin: dirlook
-          target: ${{ matrix.target }}
-          archive: dirlook-$tag-$target
-          token: ${{ secrets.GITHUB_TOKEN }}
+          targets: ${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          name="dirlook-${tag}-${{ matrix.target }}"
+          mkdir -p "dist/${name}"
+          cp "target/${{ matrix.target }}/release/dirlook" "dist/${name}/"
+          (cd dist && tar czf "${name}.tar.gz" "${name}")
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.tar.gz
