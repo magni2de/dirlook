@@ -1,0 +1,15 @@
+.DS_Store
+node_modules/
+.env
+.env.*
+dist/
+*.log
+
+
+# Added by cargo
+
+/target
+
+# Assistant / editor config (not part of the project)
+.opencode/
+opencode.json

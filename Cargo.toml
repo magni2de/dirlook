@@ -1,0 +1,14 @@
+[package]
+name = "dirlook"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "A fast, zero-dependency terminal disk usage analyzer with a tree view and a WinDirStat-style treemap."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/magni2de/dirlook"
+homepage = "https://github.com/magni2de/dirlook"
+readme = "README.md"
+keywords = ["disk-usage", "tui", "treemap", "terminal", "du"]
+categories = ["command-line-utilities", "filesystem"]
+
+[dependencies]
