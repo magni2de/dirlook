@@ -9,6 +9,7 @@ use crate::width;
 
 const SPINNER: [&str; 4] = ["|", "/", "-", "\\"];
 const BAR_FG: (u8, u8, u8) = (165, 165, 165);
+const BRANCH_FG: (u8, u8, u8) = (92, 96, 110);
 
 pub fn render(app: &App, screen: &mut Screen) {
     let (rows_u16, cols_u16) = crate::term::terminal_size();
@@ -75,7 +76,7 @@ fn draw_main(app: &App, screen: &mut Screen) {
     };
     let sort_arrow = if app.sort_desc { "↓" } else { "↑" };
     let status = format!(
-        " {} | {:.1}% of {} | sort:{} | /:legend  q:quit  ↑↓:move  →:open  ←:back  s:sort",
+        " {} | {:.1}% of {} | sort:{} | ↑↓:move  →:expand  Enter:enter  ←:back  s:sort  /:legend  q:quit",
         color::human_size(selected_size),
         pct,
         color::human_size(total),
@@ -321,45 +322,58 @@ fn draw_tree(app: &App, screen: &mut Screen, top: usize, height: usize) {
         let r = &app.visible[i];
         let row = top + (i - start);
         let is_selected = i == app.selected;
+        let size = color::human_size(r.size);
+        let size_x = name_w + 2;
 
-        let line = if r.is_parent {
-            format!(
+        if r.is_parent {
+            let line = format!(
                 "{}  {}",
                 width::pad("..", name_w, false),
-                width::pad("", size_w, true)
-            )
-        } else {
-            let indent = "  ".repeat(r.depth);
-            let prefix = if r.is_dir {
-                if r.is_expanded {
-                    "▾ "
-                } else {
-                    "▸ "
-                }
-            } else {
-                "  "
-            };
-            let name_raw = format!("{}{}{}", indent, prefix, r.name);
-            let name = width::truncate(&name_raw, name_w);
-            let size = color::human_size(r.size);
-            format!(
-                "{}  {}",
-                width::pad(&name, name_w, false),
                 width::pad(&size, size_w, true)
-            )
+            );
+            let fg = if is_selected { (20, 20, 20) } else { (120, 140, 220) };
+            let bg = if is_selected { (200, 200, 200) } else { DEFAULT_BG };
+            screen.put_str(0, row, &line, fg, bg);
+            continue;
+        }
+
+        let arrow = if r.is_dir {
+            if r.is_expanded {
+                "▾ "
+            } else {
+                "▸ "
+            }
+        } else {
+            "  "
+        };
+        let (fr, fg_, fb) = if r.is_dir {
+            color::DIR_COLOR
+        } else {
+            color::ext_color(&r.name, false)
         };
 
         if is_selected {
+            let label = format!("{}{}{}", r.prefix, arrow, r.name);
+            let name = width::truncate(&label, name_w);
+            let line = format!(
+                "{}  {}",
+                width::pad(&name, name_w, false),
+                width::pad(&size, size_w, true)
+            );
             screen.put_str(0, row, &line, (20, 20, 20), (200, 200, 200));
         } else {
-            let (fr, fg_, fb) = if r.is_parent {
-                (120, 140, 220)
-            } else if r.is_dir {
-                color::DIR_COLOR
-            } else {
-                color::ext_color(&r.name, false)
-            };
-            screen.put_str(0, row, &line, (fr, fg_, fb), DEFAULT_BG);
+            let pw = width::str_width(&r.prefix);
+            screen.put_str(0, row, &r.prefix, BRANCH_FG, DEFAULT_BG);
+            let rest_raw = format!("{}{}", arrow, r.name);
+            let rest = width::truncate(&rest_raw, name_w.saturating_sub(pw));
+            screen.put_str(pw, row, &rest, (fr, fg_, fb), DEFAULT_BG);
+            screen.put_str(
+                size_x,
+                row,
+                &width::pad(&size, size_w, true),
+                (fr, fg_, fb),
+                DEFAULT_BG,
+            );
         }
     }
 }

@@ -25,6 +25,8 @@ pub struct VisibleRow {
     pub is_dir: bool,
     pub is_expanded: bool,
     pub is_parent: bool,
+    /// Tree branch guides drawn before the name (e.g. "│  ├─ ").
+    pub prefix: String,
 }
 
 pub struct ScanState {
@@ -305,10 +307,11 @@ impl App {
                         is_dir: true,
                         is_expanded: false,
                         is_parent: true,
+                        prefix: String::new(),
                     });
                 }
             }
-            Self::collect_into(node, 0, &mut new_visible);
+            Self::collect_into(node, 0, &mut new_visible, "", true, true);
         }
         self.visible = new_visible;
         if self.selected >= self.visible.len() {
@@ -316,7 +319,20 @@ impl App {
         }
     }
 
-    fn collect_into(node: &Node, depth: usize, out: &mut Vec<VisibleRow>) {
+    fn collect_into(
+        node: &Node,
+        depth: usize,
+        out: &mut Vec<VisibleRow>,
+        guides: &str,
+        is_last: bool,
+        is_top: bool,
+    ) {
+        let prefix = if is_top {
+            String::new()
+        } else {
+            let connector = if is_last { "└─ " } else { "├─ " };
+            format!("{guides}{connector}")
+        };
         out.push(VisibleRow {
             name: node.name.clone(),
             path: node.path.clone(),
@@ -325,10 +341,18 @@ impl App {
             is_dir: node.is_dir,
             is_expanded: node.expanded,
             is_parent: false,
+            prefix,
         });
         if node.expanded {
-            for child in &node.children {
-                Self::collect_into(child, depth + 1, out);
+            let n = node.children.len();
+            let child_guides = if is_top {
+                String::new()
+            } else {
+                let guide = if is_last { "   " } else { "│  " };
+                format!("{guides}{guide}")
+            };
+            for (i, child) in node.children.iter().enumerate() {
+                Self::collect_into(child, depth + 1, out, &child_guides, i + 1 == n, false);
             }
         }
     }
@@ -432,5 +456,35 @@ mod tests {
             .expect("focus row");
         assert_eq!(first.path, sub_path);
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn tree_branch_prefixes() {
+        use std::path::PathBuf;
+        let mkfile = |n: &str| Node::file(n.to_string(), PathBuf::from(n), 1);
+        let mut d1 = Node::dir(
+            "d1".to_string(),
+            PathBuf::from("d1"),
+            2,
+            vec![mkfile("a"), mkfile("b")],
+        );
+        d1.expanded = true;
+        let d2 = Node::dir("d2".to_string(), PathBuf::from("d2"), 1, vec![mkfile("c")]);
+        let mut root = Node::dir("root".to_string(), PathBuf::from("root"), 3, vec![d1, d2]);
+        root.expanded = true;
+
+        let app = App::new(root);
+        let pref = |name: &str| {
+            app.visible
+                .iter()
+                .find(|r| r.name == name)
+                .map(|r| r.prefix.clone())
+                .unwrap_or_else(|| panic!("row {name} not found"))
+        };
+        assert_eq!(pref("root"), "");
+        assert_eq!(pref("d1"), "├─ ");
+        assert_eq!(pref("a"), "│  ├─ ");
+        assert_eq!(pref("b"), "│  └─ ");
+        assert_eq!(pref("d2"), "└─ ");
     }
 }
