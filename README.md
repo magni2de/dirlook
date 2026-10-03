@@ -58,6 +58,12 @@ Color legend (`/`):
 
 ## Install
 
+### Homebrew
+
+```sh
+brew install magni2de/dirlook/dirlook
+```
+
 ### Prebuilt binaries
 
 Download the archive for your platform from the
