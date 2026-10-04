@@ -15,8 +15,9 @@ Every release must do all of the following — don't stop after publishing:
    table must point at the new `vX.Y.Z` assets. This is easy to forget and
    leaves the README advertising the previous release.
    - macOS arm64 / x86_64, Linux x86_64 / arm64 — all four rows.
-5. Bump the Homebrew formula in the separate `magni2de/homebrew-dirlook`
-   repository: update all four `url` + `sha256` pairs to the new tag.
+5. Bump the Homebrew formula in the separate `magni2de/homebrew-tap`
+   repository (`Formula/dirlook.rb`): update all four `url` + `sha256` pairs to
+   the new tag.
    - Recompute checksums with: `curl -sL <asset-url> | shasum -a 256`
 
 ## Configuration

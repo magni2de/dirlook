@@ -99,13 +99,13 @@ method suits you, then verify the install with `dirlook --version`.
 Install straight from the tap in one command:
 
 ```sh
-brew install magni2de/dirlook/dirlook
+brew install magni2de/tap/dirlook
 ```
 
 Or add the tap first, then install by name:
 
 ```sh
-brew tap magni2de/dirlook
+brew tap magni2de/tap
 brew install dirlook
 ```
 
