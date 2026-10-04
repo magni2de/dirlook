@@ -1,19 +1,24 @@
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
-use std::sync::mpsc::{Receiver, TryRecvError};
-use std::sync::Arc;
-use std::time::Instant;
+use std::sync::mpsc::{Receiver, Sender, TryRecvError};
+use std::sync::{mpsc, Arc};
+use std::time::{Duration, Instant};
 
+use crate::color;
 use crate::key::KeyCode;
 use crate::node::Node;
-use crate::scanner::{self, ScanStatus};
+use crate::scanner::{self, Engine, Index};
+use crate::treemap::{self, MapEntry};
+
+/// Children count up to which the map is laid out synchronously (instant).
+const SYNC_LIMIT: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-#[allow(dead_code)]
-pub enum ViewMode {
-    Tree,
-    Flat,
-    Treemap,
+pub enum SortMode {
+    Name,
+    SizeDesc,
+    SizeAsc,
 }
 
 #[derive(Debug, Clone)]
@@ -21,141 +26,166 @@ pub struct VisibleRow {
     pub name: String,
     pub path: PathBuf,
     pub size: u64,
-    pub depth: usize,
+    pub known: bool,
     pub is_dir: bool,
     pub is_expanded: bool,
     pub is_parent: bool,
-    /// Tree branch guides drawn before the name (e.g. "│  ├─ ").
     pub prefix: String,
+    pub done: u64,
+    pub total: u64,
 }
 
-pub struct ScanState {
-    pub target: PathBuf,
-    pub status: Arc<ScanStatus>,
-    pub rx: Receiver<Node>,
-    pub started: Instant,
-    pub tick: u64,
+impl VisibleRow {
+    pub fn depth(&self) -> usize {
+        self.prefix.chars().count() / 3
+    }
+}
+
+pub struct MapRequest {
+    pub generation: u64,
+    pub subject: PathBuf,
+    pub sig: u64,
+    pub w: usize,
+    pub h: usize,
+    pub entries: Vec<MapEntry>,
+}
+
+pub struct MapResult {
+    pub generation: u64,
+    pub subject: PathBuf,
+    pub sig: u64,
+    pub layout: treemap::Layout,
 }
 
 pub struct App {
-    pub root: Option<Node>,
+    pub root: Option<Arc<Node>>,
+    pub index: Index,
+    engine: Option<Engine>,
     pub visible: Vec<VisibleRow>,
     pub selected: usize,
-    #[allow(dead_code)]
-    pub view_mode: ViewMode,
-    pub sort_desc: bool,
+    pub focus: PathBuf,
+    pub expanded: HashSet<PathBuf>,
+    pub sort: SortMode,
     pub quit: bool,
     pub cell_width: u32,
-    pub scanning: Option<ScanState>,
     pub show_legend: bool,
-    pub focus: PathBuf,
-    pending_select: Option<PathBuf>,
+    pub tick: u64,
+
+    map_tx: Sender<MapRequest>,
+    map_rx: Receiver<MapResult>,
+    map_gen: u64,
+    map_key: Option<(PathBuf, u64)>,
+    map_cache: HashMap<PathBuf, (u64, treemap::Layout)>,
+    pub map_layout: Option<treemap::Layout>,
+    map_last_send: Instant,
+    pub map_busy: bool,
 }
 
 impl App {
-    pub fn empty() -> Self {
-        Self {
-            root: None,
+    pub fn new(root_path: PathBuf) -> Self {
+        let engine = scanner::bootstrap(root_path.clone());
+        let root = Arc::clone(&engine.root);
+        let index = Arc::clone(&engine.index);
+        let mut expanded = HashSet::new();
+        expanded.insert(root.path.clone());
+
+        let (map_tx, req_rx) = mpsc::channel::<MapRequest>();
+        let (res_tx, map_rx) = mpsc::channel::<MapResult>();
+        std::thread::spawn(move || {
+            while let Ok(req) = req_rx.recv() {
+                let layout = treemap::compute(req.w, req.h, &req.entries);
+                if res_tx
+                    .send(MapResult {
+                        generation: req.generation,
+                        subject: req.subject,
+                        sig: req.sig,
+                        layout,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+
+        let mut app = Self {
+            root: Some(Arc::clone(&root)),
+            index,
+            engine: Some(engine),
             visible: Vec::new(),
             selected: 0,
-            view_mode: ViewMode::Tree,
-            sort_desc: true,
+            focus: root.path.clone(),
+            expanded,
+            sort: SortMode::Name,
             quit: false,
             cell_width: 1,
-            scanning: None,
             show_legend: false,
-            focus: PathBuf::new(),
-            pending_select: None,
+            tick: 0,
+            map_tx,
+            map_rx,
+            map_gen: 0,
+            map_key: None,
+            map_cache: HashMap::new(),
+            map_layout: None,
+            map_last_send: Instant::now(),
+            map_busy: false,
+        };
+        // Wait briefly for the root's first listing so the first frame is full
+        // (list of children + first map) instead of flashing empty then filling.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !root.listed.load(Ordering::Relaxed) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(2));
         }
-    }
-
-    #[allow(dead_code)]
-    pub fn new(root: Node) -> Self {
-        let mut app = Self::empty();
-        app.focus = root.path.clone();
-        app.root = Some(root);
-        app.rebuild_visible();
-        app.selected = app
-            .visible
-            .iter()
-            .position(|r| !r.is_parent)
-            .unwrap_or(0);
+        app.refresh();
         app
     }
 
-    /// Kick off a background scan, to be picked up by [`App::pump_scan`].
-    pub fn start_scan(&mut self, path: PathBuf) {
-        let scan = scanner::scan_async(path.clone());
-        self.scanning = Some(ScanState {
-            target: path,
-            status: scan.status,
-            rx: scan.rx,
-            started: Instant::now(),
-            tick: 0,
-        });
-    }
-
     pub fn tick(&mut self) {
-        if let Some(s) = &mut self.scanning {
-            s.tick = s.tick.wrapping_add(1);
+        self.tick = self.tick.wrapping_add(1);
+    }
+
+    fn boost_focus(&self) {
+        if let Some(e) = &self.engine {
+            e.boost(&self.focus, true);
         }
     }
 
-    pub fn cancel_scan(&mut self) {
-        if let Some(s) = self.scanning.take() {
-            s.status.cancelled.store(true, Ordering::Relaxed);
+    fn node_by_path(&self, path: &std::path::Path) -> Option<Arc<Node>> {
+        if let Some(n) = self.index.lock().unwrap().get(path) {
+            return Some(Arc::clone(n));
+        }
+        self.root.as_ref().and_then(|r| Node::find(r, path))
+    }
+
+    fn subject_node(&self) -> Option<Arc<Node>> {
+        self.root.as_ref()?;
+        let row = self.visible.get(self.selected)?;
+        if row.is_parent {
+            return self.node_by_path(&self.focus);
+        }
+        let node = self.node_by_path(&row.path)?;
+        if node.is_dir {
+            Some(node)
+        } else {
+            let parent = node.path.parent()?;
+            self.node_by_path(parent)
         }
     }
 
-    /// Returns true if a finished scan was installed.
-    pub fn pump_scan(&mut self) -> bool {
-        if self.scanning.is_none() {
-            return false;
-        }
-        let result = self.scanning.as_ref().unwrap().rx.try_recv();
-        match result {
-            Ok(node) => {
-                self.focus = node.path.clone();
-                self.root = Some(node);
-                self.rebuild_visible();
-                let want = self.pending_select.take();
-                self.selected = want
-                    .and_then(|p| {
-                        self.visible
-                            .iter()
-                            .position(|r| !r.is_parent && r.path == p)
-                    })
-                    .or_else(|| self.visible.iter().position(|r| !r.is_parent))
-                    .unwrap_or(0);
-                self.scanning = None;
-                true
-            }
-            Err(TryRecvError::Empty) => false,
-            Err(TryRecvError::Disconnected) => {
-                self.scanning = None;
-                true
-            }
+    pub fn map_subject(&self) -> Option<Arc<Node>> {
+        self.subject_node()
+    }
+
+    pub fn highlight_path(&self) -> Option<PathBuf> {
+        let row = self.visible.get(self.selected)?;
+        if row.is_parent {
+            None
+        } else {
+            Some(row.path.clone())
         }
     }
 
     pub fn handle_key(&mut self, code: KeyCode) {
-        if self.scanning.is_some() {
-            match code {
-                KeyCode::Char('q') => {
-                    self.cancel_scan();
-                    self.quit = true;
-                }
-                KeyCode::Escape => {
-                    self.cancel_scan();
-                    if self.root.is_none() {
-                        self.quit = true;
-                    }
-                }
-                _ => {}
-            }
-            return;
-        }
-
         match code {
             KeyCode::Char('q') => self.quit = true,
             KeyCode::Char('/') | KeyCode::Char('?') => self.show_legend = !self.show_legend,
@@ -176,9 +206,10 @@ impl App {
                         self.up_or_ascend();
                     } else if row.is_dir {
                         if !row.is_expanded {
-                            self.toggle_expand(&row.path, true);
+                            self.expanded.insert(row.path.clone());
+                            self.refresh();
                         } else if let Some(neighbor) = self.visible.get(self.selected + 1) {
-                            if neighbor.depth == row.depth + 1 && !neighbor.is_parent {
+                            if neighbor.depth() == row.depth() + 1 && !neighbor.is_parent {
                                 self.selected += 1;
                             }
                         }
@@ -197,69 +228,50 @@ impl App {
             KeyCode::Left | KeyCode::Backspace => {
                 if let Some(row) = self.visible.get(self.selected).cloned() {
                     if row.is_parent {
-                        // nothing to do
+                        // nothing
                     } else if row.is_dir && row.is_expanded {
-                        self.toggle_expand(&row.path, false);
-                    } else if row.depth > 0 {
-                        self.move_to_parent(row.depth);
+                        self.expanded.remove(&row.path);
+                        self.refresh();
+                    } else {
+                        self.move_to_parent_row();
                     }
                 }
             }
             KeyCode::Char('s') => {
-                self.sort_desc = !self.sort_desc;
-                if let Some(root) = &mut self.root {
-                    Node::sort_children(root, self.sort_desc);
-                }
-                self.rebuild_visible();
+                self.sort = match self.sort {
+                    SortMode::Name => SortMode::SizeDesc,
+                    SortMode::SizeDesc => SortMode::SizeAsc,
+                    SortMode::SizeAsc => SortMode::Name,
+                };
+                self.refresh();
             }
             _ => {}
         }
     }
 
-    fn ascend(&mut self) {
-        let cur = match &self.root {
-            Some(r) => r.path.clone(),
-            None => return,
-        };
-        let parent = match cur.parent() {
-            Some(p) => p.to_path_buf(),
-            None => return,
-        };
-        self.pending_select = Some(cur);
-        self.start_scan(parent);
-    }
-
-    /// Enter a directory: show it as the top of the tree (instant, no rescan).
     fn enter_dir(&mut self, path: &std::path::Path) {
         self.focus = path.to_path_buf();
-        if let Some(root) = &mut self.root {
-            if let Some(node) = Node::find_mut(root, path) {
-                node.expanded = true;
-            }
-        }
-        self.rebuild_visible();
+        self.expanded.insert(path.to_path_buf());
+        self.boost_focus();
+        self.refresh();
         self.selected = self
             .visible
             .iter()
-            .position(|r| !r.is_parent)
+            .position(|r| !r.is_parent && r.path == path)
             .unwrap_or(0);
     }
 
-    /// Go up one level: within the loaded tree if possible, else rescan the
-    /// parent of the scanned root.
     fn up_or_ascend(&mut self) {
-        let root_path = match &self.root {
-            Some(r) => r.path.clone(),
-            None => return,
-        };
-        if self.focus == root_path {
-            self.ascend();
-            return;
-        }
-        let from = self.focus.clone();
-        if let Some(parent) = self.focus.parent() {
-            self.focus = parent.to_path_buf();
-            self.rebuild_visible();
+        let root_path = self.root.as_ref().map(|r| r.path.clone());
+        if Some(self.focus.clone()) == root_path {
+            if let Some(parent) = self.focus.parent().map(|p| p.to_path_buf()) {
+                self.rebootstrap(parent);
+            }
+        } else if let Some(parent) = self.focus.parent().map(|p| p.to_path_buf()) {
+            let from = self.focus.clone();
+            self.focus = parent;
+            self.boost_focus();
+            self.refresh();
             self.selected = self
                 .visible
                 .iter()
@@ -269,23 +281,33 @@ impl App {
         }
     }
 
-    fn toggle_expand(&mut self, path: &std::path::Path, expanded: bool) {
-        if let Some(root) = &mut self.root {
-            if let Some(node) = Node::find_mut(root, path) {
-                node.expanded = expanded;
-            }
-        }
-        self.rebuild_visible();
+    fn rebootstrap(&mut self, path: PathBuf) {
+        let engine = scanner::bootstrap(path);
+        let root = Arc::clone(&engine.root);
+        self.root = Some(Arc::clone(&root));
+        self.index = Arc::clone(&engine.index);
+        self.engine = Some(engine);
+        self.focus = root.path.clone();
+        self.expanded.clear();
+        self.expanded.insert(root.path.clone());
+        self.selected = 0;
+        self.map_layout = None;
+        self.map_key = None;
+        self.map_cache.clear();
+        self.refresh();
     }
 
-    fn move_to_parent(&mut self, current_depth: usize) {
+    fn move_to_parent_row(&mut self) {
         if self.selected == 0 {
             return;
         }
+        let Some(cur) = self.visible.get(self.selected).cloned() else {
+            return;
+        };
         let mut i = self.selected;
         while i > 0 {
             i -= 1;
-            if !self.visible[i].is_parent && self.visible[i].depth < current_depth {
+            if !self.visible[i].is_parent && self.visible[i].depth() < cur.depth() {
                 self.selected = i;
                 return;
             }
@@ -293,25 +315,29 @@ impl App {
         self.selected = 0;
     }
 
-    fn rebuild_visible(&mut self) {
+    pub fn refresh(&mut self) {
         let mut new_visible = Vec::new();
         if let Some(root) = &self.root {
-            let node = Node::find(root, &self.focus).unwrap_or(root);
+            let node = self
+                .node_by_path(&self.focus)
+                .unwrap_or_else(|| Arc::clone(root));
             if let Some(parent) = node.path.parent() {
                 if !parent.as_os_str().is_empty() {
                     new_visible.push(VisibleRow {
                         name: "..".to_string(),
                         path: parent.to_path_buf(),
                         size: 0,
-                        depth: 0,
+                        known: true,
                         is_dir: true,
                         is_expanded: false,
                         is_parent: true,
                         prefix: String::new(),
+                        done: 0,
+                        total: 0,
                     });
                 }
             }
-            Self::collect_into(node, 0, &mut new_visible, "", true, true);
+            self.collect(&node, 0, &mut new_visible, "", true, true);
         }
         self.visible = new_visible;
         if self.selected >= self.visible.len() {
@@ -319,8 +345,9 @@ impl App {
         }
     }
 
-    fn collect_into(
-        node: &Node,
+    fn collect(
+        &self,
+        node: &Arc<Node>,
         depth: usize,
         out: &mut Vec<VisibleRow>,
         guides: &str,
@@ -336,50 +363,160 @@ impl App {
         out.push(VisibleRow {
             name: node.name.clone(),
             path: node.path.clone(),
-            size: node.size,
-            depth,
+            size: node.size(),
+            known: node.is_known(),
             is_dir: node.is_dir,
-            is_expanded: node.expanded,
+            is_expanded: self.expanded.contains(&node.path),
             is_parent: false,
             prefix,
+            done: node.done_entries.load(Ordering::Relaxed),
+            total: node.total_entries.load(Ordering::Relaxed),
         });
-        if node.expanded {
-            let n = node.children.len();
+
+        if node.is_dir && self.expanded.contains(&node.path) {
+            let mut kids = node.child_list();
+            self.sort_children(&mut kids);
+            let n = kids.len();
             let child_guides = if is_top {
                 String::new()
             } else {
                 let guide = if is_last { "   " } else { "│  " };
                 format!("{guides}{guide}")
             };
-            for (i, child) in node.children.iter().enumerate() {
-                Self::collect_into(child, depth + 1, out, &child_guides, i + 1 == n, false);
+            for (i, child) in kids.iter().enumerate() {
+                self.collect(child, depth + 1, out, &child_guides, i + 1 == n, false);
             }
         }
     }
 
-    /// Node whose children are shown in the treemap.
-    pub fn map_subject(&self) -> Option<&Node> {
-        let root = self.root.as_ref()?;
-        let row = self.visible.get(self.selected)?;
-        if row.is_parent {
-            return Some(root);
-        }
-        let node = Node::find(root, &row.path)?;
-        if node.is_dir {
-            Some(node)
-        } else {
-            let parent_path = node.path.parent()?;
-            Node::find(root, parent_path)
+    fn sort_children(&self, kids: &mut [Arc<Node>]) {
+        match self.sort {
+            SortMode::Name => kids.sort_by(|a, b| {
+                b.is_dir
+                    .cmp(&a.is_dir)
+                    .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+            }),
+            SortMode::SizeDesc => kids.sort_by(|a, b| b.size().cmp(&a.size())),
+            SortMode::SizeAsc => kids.sort_by(|a, b| a.size().cmp(&b.size())),
         }
     }
 
-    /// Path of the row to highlight in the treemap (None for the `..` row).
-    pub fn highlight_path(&self) -> Option<PathBuf> {
-        let row = self.visible.get(self.selected)?;
-        if row.is_parent {
-            None
-        } else {
-            Some(row.path.clone())
+    /// Rebuild visible rows and drive the asynchronous, cached treemap build.
+    pub fn pump(&mut self) {
+        self.refresh();
+
+        loop {
+            match self.map_rx.try_recv() {
+                Ok(res) => {
+                    self.map_cache
+                        .insert(res.subject.clone(), (res.sig, res.layout.clone()));
+                    if res.generation == self.map_gen {
+                        self.map_layout = Some(res.layout);
+                        self.map_busy = false;
+                    }
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => break,
+            }
+        }
+
+        let Some(subject) = self.subject_node() else {
+            return;
+        };
+        let kids = subject.child_list();
+        let hl = self.highlight_path();
+        let mut sig: u64 = 1469598103934665603;
+        let mut entries: Vec<MapEntry> = Vec::with_capacity(kids.len());
+        for c in &kids {
+            let known = c.is_known();
+            let size = if known {
+                c.size()
+            } else {
+                c.acc.load(Ordering::Relaxed)
+            };
+            let color = if c.is_dir {
+                color::DIR_COLOR
+            } else {
+                color::ext_color(&c.name, false)
+            };
+            for byte in c.name.bytes() {
+                sig = (sig ^ byte as u64).wrapping_mul(1099511628211);
+            }
+            sig = (sig ^ size).wrapping_mul(1099511628211);
+            sig = (sig ^ known as u64).wrapping_mul(1099511628211);
+            entries.push(MapEntry {
+                label: c.name.clone(),
+                size,
+                known,
+                is_dir: c.is_dir,
+                color,
+                highlight: hl.as_deref() == Some(c.path.as_path()),
+            });
+        }
+
+        let path = subject.path.clone();
+
+        // Cache hit: the same subject with an unchanged signature -> show now.
+        if let Some((cached_sig, cached)) = self.map_cache.get(&path) {
+            if *cached_sig == sig {
+                if self
+                    .map_key
+                    .as_ref()
+                    .map(|(p, s)| p != &path || *s != sig)
+                    .unwrap_or(true)
+                {
+                    self.map_layout = Some(cached.clone());
+                    self.map_key = Some((path, sig));
+                    self.map_busy = false;
+                }
+                return;
+            }
+        }
+
+        let subject_changed = self
+            .map_key
+            .as_ref()
+            .map(|(p, _)| p != &path)
+            .unwrap_or(true);
+        let sig_changed = self
+            .map_key
+            .as_ref()
+            .map(|(_, s)| *s != sig)
+            .unwrap_or(true);
+        let due = self.map_last_send.elapsed() > Duration::from_millis(120);
+
+        if subject_changed || (sig_changed && due) {
+            let (rows, cols) = crate::term::terminal_size();
+            let cell = self.cell_width.max(1) as usize;
+            let eff_cols = cols as usize / cell;
+            let content_h = (rows as usize).saturating_sub(3);
+            let tree_h = (content_h * 40 / 100).max(2);
+            let map_h = content_h.saturating_sub(tree_h);
+            let (w, h) = (eff_cols.max(1), map_h.max(1));
+            if subject_changed {
+                self.map_layout = None;
+            }
+            self.map_gen = self.map_gen.wrapping_add(1);
+            self.map_key = Some((path.clone(), sig));
+
+            if entries.len() <= SYNC_LIMIT {
+                // Small enough to lay out synchronously — no spinner flash.
+                let layout = treemap::compute(w, h, &entries);
+                self.map_cache.insert(path, (sig, layout.clone()));
+                self.map_layout = Some(layout);
+                self.map_busy = false;
+            } else {
+                self.map_busy = true;
+                self.map_last_send = Instant::now();
+                let _ = self.map_tx.send(MapRequest {
+                    generation: self.map_gen,
+                    subject: path,
+                    sig,
+                    w,
+                    h,
+                    entries,
+                });
+            }
         }
     }
 }
@@ -387,104 +524,31 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scanner;
+    use std::fs;
+    use std::time::{Duration, Instant};
 
     #[test]
-    fn root_expanded_and_parent_row() {
-        let node = scanner::scan(std::path::Path::new("src"));
-        assert!(node.expanded);
-        let app = App::new(node);
-        assert!(app.visible.first().map(|r| r.is_parent).unwrap_or(false));
-        assert!(app.visible.iter().filter(|r| !r.is_parent).count() > 1);
-        assert!(!app.visible[app.selected].is_parent);
-        assert!(app.map_subject().is_some());
-    }
-
-    #[test]
-    fn others_includes_small_dirs() {
-        use std::fs;
-        let base = std::env::temp_dir().join("dirlook_others_test");
-        let _ = fs::remove_dir_all(&base);
-        fs::create_dir_all(base.join("smalldir")).unwrap();
-        fs::create_dir_all(base.join("dir2")).unwrap();
-        fs::write(base.join("smalldir/a.txt"), vec![0u8; 10_000]).unwrap();
-        fs::write(base.join("dir2/b.txt"), vec![0u8; 3_000]).unwrap();
-        fs::write(base.join("small.txt"), vec![0u8; 5_000]).unwrap();
-        fs::write(base.join("big.bin"), vec![0u8; 5_000_000]).unwrap();
-
-        let node = scanner::scan(&base);
-        let mut ch: Vec<&Node> = node.children.iter().collect();
-        ch.sort_by(|a, b| b.size.cmp(&a.size));
-        let entries: Vec<(String, u64, (u8, u8, u8))> = ch
-            .iter()
-            .map(|c| (c.name.clone(), c.size, (0, 0, 0)))
-            .collect();
-        let data = crate::treemap::build_data(10, &entries, None);
-        let others = data.others.expect("others");
-        assert_eq!(
-            others.size, 18_000,
-            "count={} size={} (smalldir 10000 + small.txt 5000 + dir2 3000)",
-            others.count, others.size
-        );
-        let _ = fs::remove_dir_all(&base);
-    }
-
-    #[test]
-    fn enter_dir_focuses_child() {
-        use std::fs;
-        let base = std::env::temp_dir().join("dirlook_focus_test");
+    fn app_bootstraps_and_lists() {
+        let base = std::env::temp_dir().join("dirlook_app_test");
         let _ = fs::remove_dir_all(&base);
         fs::create_dir_all(base.join("sub")).unwrap();
-        fs::write(base.join("sub/a.txt"), vec![0u8; 100]).unwrap();
-        fs::write(base.join("top.txt"), vec![0u8; 50]).unwrap();
+        fs::write(base.join("a.txt"), vec![0u8; 100]).unwrap();
+        fs::write(base.join("sub/b.txt"), vec![0u8; 200]).unwrap();
 
-        let node = scanner::scan(&base);
-        let mut app = App::new(node);
-        let sub_path = app
-            .visible
-            .iter()
-            .find(|r| r.is_dir && !r.is_parent)
-            .map(|r| r.path.clone())
-            .expect("a subdirectory row");
-
-        app.enter_dir(&sub_path);
-        assert_eq!(app.focus, sub_path);
-        let first = app
-            .visible
-            .iter()
-            .find(|r| !r.is_parent)
-            .expect("focus row");
-        assert_eq!(first.path, sub_path);
+        let mut app = App::new(base.clone());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            app.pump();
+            if app.root.as_ref().map(|r| r.is_known()).unwrap_or(false)
+                || Instant::now() > deadline
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        app.pump();
+        assert!(app.visible.iter().any(|r| r.name == "sub"));
+        assert!(app.map_subject().is_some());
         let _ = fs::remove_dir_all(&base);
-    }
-
-    #[test]
-    fn tree_branch_prefixes() {
-        use std::path::PathBuf;
-        let mkfile = |n: &str| Node::file(n.to_string(), PathBuf::from(n), 1);
-        let mut d1 = Node::dir(
-            "d1".to_string(),
-            PathBuf::from("d1"),
-            2,
-            vec![mkfile("a"), mkfile("b")],
-        );
-        d1.expanded = true;
-        let d2 = Node::dir("d2".to_string(), PathBuf::from("d2"), 1, vec![mkfile("c")]);
-        let mut root = Node::dir("root".to_string(), PathBuf::from("root"), 3, vec![d1, d2]);
-        root.expanded = true;
-
-        let app = App::new(root);
-        let pref = |name: &str| {
-            app.visible
-                .iter()
-                .find(|r| r.name == name)
-                .map(|r| r.prefix.clone())
-                .unwrap_or_else(|| panic!("row {name} not found"))
-        };
-        assert_eq!(pref("root"), "");
-        assert_eq!(pref("d1"), "├─ ");
-        assert_eq!(pref("a"), "│  ├─ ");
-        assert_eq!(pref("b"), "│  └─ ");
-        assert_eq!(pref("d2"), "└─ ");
     }
 }

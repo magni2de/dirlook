@@ -1,180 +1,226 @@
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{channel, Receiver};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 use crate::node::Node;
 
-/// Live per-directory progress. `total`/`done` count the directory's *immediate*
-/// children (known right after listing, no extra pass); `partial` is the size of
-/// the subtree found so far.
-pub struct DirNode {
-    pub total: u64,
-    pub done: AtomicU64,
-    pub partial: AtomicU64,
+pub type Index = Arc<Mutex<HashMap<PathBuf, Arc<Node>>>>;
+
+struct Queue {
+    high: Mutex<VecDeque<Arc<Node>>>,
+    low: Mutex<VecDeque<Arc<Node>>>,
+    cancel: AtomicBool,
 }
 
-/// One immediate child of the scanned root, shown in the progress list.
-pub struct RootChild {
-    pub name: String,
+impl Queue {
+    fn push(&self, node: Arc<Node>, high: bool) {
+        if node.queued.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let mut q = if high {
+            self.high.lock().unwrap()
+        } else {
+            self.low.lock().unwrap()
+        };
+        q.push_back(node);
+    }
+
+    fn pop(&self) -> Option<Arc<Node>> {
+        if let Some(n) = self.high.lock().unwrap().pop_front() {
+            return Some(n);
+        }
+        self.low.lock().unwrap().pop_front()
+    }
 }
 
-pub struct ScanStatus {
-    pub chain: Mutex<Vec<Arc<DirNode>>>,
-    pub root_children: Mutex<Vec<Arc<RootChild>>>,
-    pub dirs: AtomicU64,
-    pub files: AtomicU64,
-    pub bytes: AtomicU64,
-    pub done: AtomicBool,
-    pub cancelled: AtomicBool,
+/// Background, multi-threaded scan engine for one scanned root.
+pub struct Engine {
+    pub root: Arc<Node>,
+    pub index: Index,
+    queue: Arc<Queue>,
+    handles: Vec<thread::JoinHandle<()>>,
 }
 
-impl ScanStatus {
-    fn new() -> Self {
-        Self {
-            chain: Mutex::new(Vec::new()),
-            root_children: Mutex::new(Vec::new()),
-            dirs: AtomicU64::new(0),
-            files: AtomicU64::new(0),
-            bytes: AtomicU64::new(0),
-            done: AtomicBool::new(false),
-            cancelled: AtomicBool::new(false),
+impl Engine {
+    /// Ask a directory's (not yet scheduled) subtree to be scanned first.
+    pub fn boost(&self, path: &Path, high: bool) {
+        let node = self.index.lock().unwrap().get(path).cloned();
+        if let Some(n) = node {
+            self.queue.push(n, high);
         }
     }
 }
 
-pub struct Scan {
-    pub status: Arc<ScanStatus>,
-    pub rx: Receiver<Node>,
+impl Drop for Engine {
+    fn drop(&mut self) {
+        self.queue.cancel.store(true, Ordering::Relaxed);
+        for h in self.handles.drain(..) {
+            let _ = h.join();
+        }
+    }
 }
 
-/// Start a scan on a detached background thread.
-pub fn scan_async(root: PathBuf) -> Scan {
-    let status = Arc::new(ScanStatus::new());
-    let (tx, rx) = channel();
-    let st = Arc::clone(&status);
-    let _ = thread::spawn(move || {
-        let node = scan_root(&root, &st);
-        st.done.store(true, Ordering::Relaxed);
-        let _ = tx.send(node);
-    });
-    Scan { status, rx }
-}
-
-/// Synchronous scan (kept for tests and simple use).
-#[allow(dead_code)]
-pub fn scan(root: &Path) -> Node {
-    let status = Arc::new(ScanStatus::new());
-    scan_root(root, &status)
-}
-
-fn scan_root(root: &Path, st: &Arc<ScanStatus>) -> Node {
-    let canon = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+pub fn bootstrap(root_path: PathBuf) -> Engine {
+    let canon = fs::canonicalize(&root_path).unwrap_or(root_path);
     let name = canon
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| canon.to_string_lossy().to_string());
+    let root = Node::dir(name, canon.clone(), None);
+    let index: Index = Arc::new(Mutex::new(HashMap::new()));
+    index.lock().unwrap().insert(canon, Arc::clone(&root));
 
-    let mut ancestors: Vec<Arc<DirNode>> = Vec::new();
-    let (size, children) = scan_dir(&canon, st, &mut ancestors, true);
-    let mut node = Node::dir(name, canon, size, children);
-    node.expanded = true;
-    node
+    let queue = Arc::new(Queue {
+        high: Mutex::new(VecDeque::new()),
+        low: Mutex::new(VecDeque::new()),
+        cancel: AtomicBool::new(false),
+    });
+    queue.push(Arc::clone(&root), true);
+
+    let workers = thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .clamp(1, 8);
+
+    let mut handles = Vec::with_capacity(workers);
+    for _ in 0..workers {
+        let q = Arc::clone(&queue);
+        let idx = Arc::clone(&index);
+        handles.push(thread::spawn(move || worker(q, idx)));
+    }
+
+    Engine {
+        root,
+        index,
+        queue,
+        handles,
+    }
 }
 
-fn scan_dir(
-    dir: &Path,
-    st: &Arc<ScanStatus>,
-    ancestors: &mut Vec<Arc<DirNode>>,
-    is_root: bool,
-) -> (u64, Vec<Node>) {
-    if st.cancelled.load(Ordering::Relaxed) {
-        return (0, Vec::new());
+fn worker(queue: Arc<Queue>, index: Index) {
+    loop {
+        if queue.cancel.load(Ordering::Relaxed) {
+            return;
+        }
+        match queue.pop() {
+            Some(node) => process_dir(&node, &queue, &index),
+            None => thread::sleep(Duration::from_millis(2)),
+        }
     }
+}
 
-    // List immediate children first so `total` is known up front.
-    let entries: Vec<fs::DirEntry> = fs::read_dir(dir)
-        .map(|it| it.filter_map(Result::ok).collect())
-        .unwrap_or_default();
+fn process_dir(node: &Arc<Node>, queue: &Arc<Queue>, index: &Index) {
+    let entries: Vec<fs::DirEntry> = match fs::read_dir(&node.path) {
+        Ok(it) => it.filter_map(Result::ok).collect(),
+        Err(_) => {
+            node.listed.store(true, Ordering::Relaxed);
+            finalize(node);
+            return;
+        }
+    };
 
-    // For the scanned root, publish the immediate children for the progress list.
-    if is_root {
-        let rc: Vec<Arc<RootChild>> = entries
-            .iter()
-            .map(|e| {
-                Arc::new(RootChild {
-                    name: e.file_name().to_string_lossy().to_string(),
-                })
-            })
-            .collect();
-        if let Ok(mut list) = st.root_children.lock() {
-            *list = rc;
+    node.total_entries
+        .store(entries.len() as u64, Ordering::Relaxed);
+
+    let mut dir_children: Vec<Arc<Node>> = Vec::new();
+    for entry in entries {
+        let path = entry.path();
+        let meta = match entry.metadata() {
+            Ok(m) => m,
+            Err(_) => {
+                node.done_entries.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+        };
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+
+        if meta.is_dir() {
+            let child = Node::dir(name, path.clone(), Some(node));
+            node.children.lock().unwrap().push(Arc::clone(&child));
+            index.lock().unwrap().insert(path, Arc::clone(&child));
+            dir_children.push(child);
+        } else if meta.is_file() {
+            let size = meta.len();
+            let child = Node::file(name, path.clone(), size);
+            node.children.lock().unwrap().push(Arc::clone(&child));
+            index.lock().unwrap().insert(path, Arc::clone(&child));
+            node.acc.fetch_add(size, Ordering::Relaxed);
+            node.done_entries.fetch_add(1, Ordering::Relaxed);
+        } else {
+            node.done_entries.fetch_add(1, Ordering::Relaxed);
         }
     }
 
-    let me = Arc::new(DirNode {
-        total: entries.len() as u64,
-        done: AtomicU64::new(0),
-        partial: AtomicU64::new(0),
-    });
-    ancestors.push(Arc::clone(&me));
-    st.dirs.fetch_add(1, Ordering::Relaxed);
-    if let Ok(mut chain) = st.chain.lock() {
-        chain.push(Arc::clone(&me));
+    node.listed.store(true, Ordering::Relaxed);
+    node.remaining
+        .store(dir_children.len() as u64, Ordering::Relaxed);
+
+    if dir_children.is_empty() {
+        finalize(node);
+    } else {
+        for c in dir_children {
+            queue.push(c, false);
+        }
     }
+}
 
-    let mut total: u64 = 0;
-    let mut dirs: Vec<Node> = Vec::new();
-    let mut files: Vec<(String, PathBuf, u64)> = Vec::new();
+/// Mark a directory known and propagate its size up to its ancestors.
+fn finalize(node: &Arc<Node>) {
+    let mut cur = Arc::clone(node);
+    loop {
+        cur.size.store(cur.acc.load(Ordering::Relaxed), Ordering::Relaxed);
+        cur.known.store(true, Ordering::Relaxed);
 
-    for entry in entries {
-        if st.cancelled.load(Ordering::Relaxed) {
+        let parent = cur
+            .parent
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|w| w.upgrade());
+        let Some(p) = parent else {
+            break;
+        };
+        p.acc.fetch_add(cur.size.load(Ordering::Relaxed), Ordering::Relaxed);
+        p.done_entries.fetch_add(1, Ordering::Relaxed);
+        if p.remaining.fetch_sub(1, Ordering::Relaxed) == 1 {
+            cur = p;
+        } else {
             break;
         }
-        let path = entry.path();
-        match entry.metadata() {
-            Ok(meta) if meta.is_dir() => {
-                let dn = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_default();
-                let (dir_size, children) = scan_dir(&path, st, ancestors, false);
-                total += dir_size;
-                dirs.push(Node::dir(dn, path, dir_size, children));
-            }
-            Ok(meta) if meta.is_file() => {
-                let size = meta.len();
-                total += size;
-                st.files.fetch_add(1, Ordering::Relaxed);
-                st.bytes.fetch_add(size, Ordering::Relaxed);
-                for a in ancestors.iter() {
-                    a.partial.fetch_add(size, Ordering::Relaxed);
-                }
-                let file_name = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_default();
-                files.push((file_name, path, size));
-            }
-            _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn engine_scans_small_tree() {
+        let base = std::env::temp_dir().join("dirlook_engine_test");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("sub")).unwrap();
+        fs::write(base.join("a.bin"), vec![0u8; 1000]).unwrap();
+        fs::write(base.join("sub/b.bin"), vec![0u8; 2000]).unwrap();
+        fs::write(base.join("sub/c.bin"), vec![0u8; 3000]).unwrap();
+
+        let engine = bootstrap(base.clone());
+        let root = Arc::clone(&engine.root);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !root.is_known() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
         }
-        me.done.fetch_add(1, Ordering::Relaxed);
+        assert!(root.is_known(), "root not finalized in time");
+        assert_eq!(root.size(), 6000);
+
+        drop(engine);
+        let _ = fs::remove_dir_all(&base);
     }
-
-    ancestors.pop();
-    if let Ok(mut chain) = st.chain.lock() {
-        chain.pop();
-    }
-
-    dirs.sort_by(|a, b| b.size.cmp(&a.size));
-    files.sort_by(|a, b| b.2.cmp(&a.2));
-
-    let mut nodes = dirs;
-    for (name, path, size) in files.into_iter().take(2000) {
-        nodes.push(Node::file(name, path, size));
-    }
-
-    (total, nodes)
 }

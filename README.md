@@ -34,18 +34,21 @@ cargo run --release -- ~/Downloads
 
 ## Features
 
-- **Tree view** with sizes, expand/collapse, and `Enter` to dive into a folder.
+- **Tree view** with sizes, tree-branch guides, expand/collapse, and `Enter` to
+  dive into a folder.
 - **Squarified treemap** — blocks sized proportionally and colored by file type
   (images, video, audio, archives, documents, code, binaries, directories).
 - **Color legend** toggled with `/`.
+- **Live, interactive scan** — the listing appears immediately and sizes are filled
+  in from the background, so you can keep navigating, expanding and entering folders
+  while the scan runs. Unknown sizes show a spinner in the tree and pale `?` blocks
+  in the map.
+- **Parallel scan** — a worker pool scans the tree concurrently, prioritizing the
+  directory the cursor is on.
+- **In-memory map cache** — a treemap built once is reused instantly when you come
+  back to that directory.
 - **`⋯ others` chip** — tiny entries are aggregated, so the map never fills up
   with invisible specks.
-- **Fast background scan** with a live progress screen: overall progress, a
-  per-folder progress bar, running counters (directories / files / size) and
-  elapsed time.
-- **Instant navigation, no rescans** — the scanned tree is kept in memory, so
-  `Enter` into a folder and going back up are immediate. Only going above the
-  current root scans a new (parent) directory in the background.
 - **Zero dependencies** — pure `std` + POSIX FFI (`termios`, `poll`, `ioctl`, `read`).
 - **Double-buffered rendering** — only the cells that changed are redrawn, so the
   UI updates without flicker.
@@ -108,9 +111,25 @@ Running `dirlook` with no arguments analyzes the current directory.
 | `Right` | Expand / collapse a folder in the tree |
 | `Enter` | Enter the selected folder (or go to the parent on `..`) |
 | `Left`, `Backspace` | Collapse / move to the parent row |
-| `s` | Toggle sort order |
+| `s` | Cycle sort order (name / size) |
 | `/` | Toggle the color legend |
 | `q` | Quit |
+
+## Performance & caching
+
+- **Live, multi-threaded scan** — the walk runs on a pool of worker threads
+  (`min(logical CPUs, 8)`). The directory the cursor is on is scanned first (a
+  priority queue); everything else follows on spare capacity. The UI never blocks.
+- **Instant first paint** — dirlook waits briefly (up to a second) for the root's
+  listing before drawing the first frame, so the very first screen is already full;
+  sizes then stream in live.
+- **In-memory map cache** — every built treemap is cached under `(path + a
+  signature of its children)`. Navigating away and back reuses it instantly, and it
+  is only rebuilt when the sizes actually change. The cache lives only for the
+  session — nothing is written to disk.
+- **Off the critical path** — treemaps are laid out in a dedicated thread; small
+  directories are computed synchronously in the same frame (no flicker), while very
+  large ones show a spinner until ready.
 
 ## How it works
 
@@ -119,13 +138,10 @@ Running `dirlook` with no arguments analyzes the current directory.
   going through the buffered standard input would swallow the whole escape
   sequence and hide the remaining bytes from `poll`, which makes a single arrow
   press look like a bare `Esc`.
-- **Scanning** — the recursive walk runs on a background thread and publishes
-  live counters and the current directory stack through atomics, so the UI keeps
-  animating while it works.
-- **Caching** — the scanned tree is kept in memory. Entering a folder or moving
-  back up only changes which subtree is displayed; nothing is re-scanned.
-- **Rendering** — a double-buffered screen emits only the changed cells each
-  frame, and the app runs on the terminal's alternate screen.
+- **Tree** — nodes are shared (`Arc`) and updated live through atomics, so the scan
+  threads and the UI see the same tree without locking on the hot path.
+- **Rendering** — a double-buffered screen emits only the changed cells each frame,
+  and the app runs on the terminal's alternate screen.
 
 ## Platform support
 
