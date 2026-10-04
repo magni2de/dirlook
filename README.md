@@ -6,12 +6,20 @@
 [![platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-blue)](#-platform-support)
 [![CI](https://github.com/magni2de/dirlook/actions/workflows/ci.yml/badge.svg)](https://github.com/magni2de/dirlook/actions/workflows/ci.yml)
 
-> A fast, zero-dependency terminal disk usage analyzer with a tree view and a
-> treemap, written in Rust.
-
 ![dirlook](screenshots/main.png)
 
-`dirlook` scans a directory and shows two synchronized views:
+`dirlook` is a fast, zero-dependency terminal disk usage analyzer written in Rust
+that shows you, at a glance, where the space in a directory actually goes. Run it
+on a folder and it walks the whole tree, then lays every entry out visually — the
+more a folder or file takes up, the larger its block is.
+
+Disk usage is easy to fill and hard to reason about: a couple of heavy folders
+buried deep in the tree are usually the culprit, and a flat list of sizes makes
+them tedious to spot. `dirlook` turns that same information into a picture you can
+navigate — see which directories dominate, drill into them, and find the files
+behind a bloated folder without leaving the terminal.
+
+It shows two synchronized views of the same tree:
 
 - a **tree** of folders and files with their sizes, and
 - a **treemap** (a "data map") where every block's area is proportional to its
