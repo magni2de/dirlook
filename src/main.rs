@@ -101,6 +101,8 @@ KEYS:
     Enter              Enter directory (or go to parent on '..')
     Left, Backspace    Collapse / move to parent
     s                  Cycle sort (name / size desc / size asc)
+    [ / ]              Move the tree/map divider (left/right side-by-side, up/down stacked)
+    m                  Toggle layout (side-by-side / stacked)
     /                  Toggle color legend
     q                  Quit"
     );

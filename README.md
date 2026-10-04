@@ -6,7 +6,7 @@
 [![platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-blue)](#-platform-support)
 [![CI](https://github.com/magni2de/dirlook/actions/workflows/ci.yml/badge.svg)](https://github.com/magni2de/dirlook/actions/workflows/ci.yml)
 
-![dirlook](screenshots/main.png)
+![dirlook](screenshots/side-by-side.png)
 
 `dirlook` is a fast, zero-dependency terminal disk usage analyzer written in Rust
 that shows you, at a glance, where the space in a directory actually goes. Run it
@@ -25,6 +25,10 @@ It shows two synchronized views of the same tree:
 - a **treemap** (a "data map") where every block's area is proportional to its
   size and colored by file type.
 
+The two views share the same selection and can be arranged either **side-by-side**
+(tree on the left, map on the right — the default) or **stacked** (tree on top,
+map below). Press `m` to switch between them and `[` / `]` to move the divider.
+
 No external crates and no config files: it is a single self-contained binary built
 on the Rust standard library plus a small amount of POSIX FFI.
 
@@ -36,6 +40,9 @@ on the Rust standard library plus a small amount of POSIX FFI.
   dive into a folder.
 - **Squarified treemap** — blocks sized proportionally and colored by file type
   (images, video, audio, archives, documents, code, binaries, directories).
+- **Two switchable layouts** — **side-by-side** (default) or **stacked**,
+  toggled with `m`; `[` / `]` move the divider, and each layout keeps its own
+  split.
 - **Color legend** toggled with `/`.
 - **Live, interactive scan** — the listing appears immediately and sizes are filled
   in from the background, so you can keep navigating, expanding and entering folders
@@ -82,6 +89,14 @@ on the Rust standard library plus a small amount of POSIX FFI.
 ---
 
 ## 🖼️ Screenshots
+
+**Side-by-side** (default) — tree on the left, map on the right:
+
+![side-by-side layout](screenshots/side-by-side.png)
+
+**Stacked** — tree on top, map below:
+
+![stacked layout](screenshots/stacked.png)
 
 Color legend (`/`):
 
@@ -163,6 +178,17 @@ dirlook [OPTIONS] [PATH]
 
 Running `dirlook` with no arguments analyzes the current directory.
 
+### Layouts
+
+The tree and the map are always shown together, in one of two layouts:
+
+- **Side-by-side** (default) — tree on the left, map on the right; `[` / `]` move
+  the vertical divider.
+- **Stacked** — tree on top, map below; `[` / `]` move the horizontal divider.
+
+Press `m` to toggle. Each layout remembers its own split — 30/70 side-by-side and
+40/60 stacked by default.
+
 ## ⌨️ Keys
 
 | Key | Action |
@@ -172,6 +198,8 @@ Running `dirlook` with no arguments analyzes the current directory.
 | `Enter` | Enter the selected folder (or go to the parent on `..`) |
 | `Left`, `Backspace` | Collapse / move to the parent row |
 | `s` | Cycle sort order (name / size) |
+| `[` / `]` | Move the tree/map divider — left/right side-by-side, up/down stacked |
+| `m` | Toggle layout (side-by-side / stacked) |
 | `/` | Toggle the color legend |
 | `q` | Quit |
 

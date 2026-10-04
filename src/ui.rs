@@ -1,4 +1,4 @@
-use crate::app::App;
+use crate::app::{App, Divider, LayoutMode};
 use crate::color;
 use crate::screen::{Screen, DEFAULT_BG};
 use crate::treemap;
@@ -6,6 +6,7 @@ use crate::width;
 
 const SPINNER: [&str; 4] = ["|", "/", "-", "\\"];
 const BRANCH_FG: (u8, u8, u8) = (92, 96, 110);
+const CHROME_FG: (u8, u8, u8) = (130, 130, 140);
 
 pub fn render(app: &App, screen: &mut Screen) {
     let (rows_u16, cols_u16) = crate::term::terminal_size();
@@ -20,28 +21,65 @@ pub fn render(app: &App, screen: &mut Screen) {
     screen.resize(rows, eff_cols, cell);
     screen.clear();
 
-    let content_h = rows.saturating_sub(3);
-    let tree_h = (content_h * 40 / 100).max(2);
-    let map_h = content_h.saturating_sub(tree_h);
-    let tree_top = 1usize;
-    let sep_row = tree_top + tree_h;
-    let map_top = sep_row + 1;
+    let regions = app.regions(rows, eff_cols);
     let status_row = rows.saturating_sub(1);
 
-    // Header
-    let scan = if app.map_busy { SPINNER[(app.tick as usize) % 4] } else { " " };
-    let header = format!("[dirlook — {}]  {}", app.focus.display(), scan);
-    screen.put_str(
-        0,
-        0,
-        &width::pad(&header, eff_cols, false),
-        (130, 130, 140),
-        DEFAULT_BG,
-    );
+    // Header — in the vertical layout the horizontal map separator is gone, so
+    // the map subject/size moves to the right side of the header line.
+    let scan = if app.map_busy {
+        SPINNER[(app.tick as usize) % 4]
+    } else {
+        " "
+    };
+    let left = format!("[dirlook — {}]  {}", app.focus.display(), scan);
+    if regions.mode == LayoutMode::Vertical {
+        let right = format!(" {} ", map_label(app));
+        let right_w = width::str_width(&right);
+        if right_w + 1 < eff_cols {
+            let avail = eff_cols - right_w;
+            let left_t = width::truncate(&left, avail.saturating_sub(1));
+            let mut line = width::pad(&left_t, avail, false);
+            line.push_str(&right);
+            screen.put_str(0, 0, &line, CHROME_FG, DEFAULT_BG);
+        } else {
+            screen.put_str(
+                0,
+                0,
+                &width::pad(&left, eff_cols, false),
+                CHROME_FG,
+                DEFAULT_BG,
+            );
+        }
+    } else {
+        screen.put_str(
+            0,
+            0,
+            &width::pad(&left, eff_cols, false),
+            CHROME_FG,
+            DEFAULT_BG,
+        );
+    }
 
-    draw_tree(app, screen, tree_top, tree_h);
-    draw_separator(app, screen, sep_row);
-    draw_map(app, screen, map_top, map_h);
+    draw_tree(
+        app,
+        screen,
+        regions.tree.x,
+        regions.tree.y,
+        regions.tree.w,
+        regions.tree.h,
+    );
+    match regions.divider {
+        Divider::Vertical(col) => draw_vseparator(screen, col, regions.tree.y, regions.tree.h),
+        Divider::Horizontal(row) => draw_separator(app, screen, row),
+    }
+    draw_map(
+        app,
+        screen,
+        regions.map.x,
+        regions.map.y,
+        regions.map.w,
+        regions.map.h,
+    );
 
     // Status
     let selected = app.visible.get(app.selected);
@@ -58,7 +96,7 @@ pub fn render(app: &App, screen: &mut Screen) {
         crate::app::SortMode::SizeAsc => "size↑",
     };
     let status = format!(
-        " {} | {:.1}% of {} | sort:{} | ↑↓:move  →:expand  Enter:enter  ←:back  s:sort  /:legend  q:quit",
+        " {} | {:.1}% of {} | sort:{} | ↑↓:move  →:expand  Enter:enter  ←:back  s:sort  []:split  m:layout  /:legend  q:quit",
         color::human_size(sel_size),
         pct,
         color::human_size(focus_size),
@@ -84,6 +122,20 @@ pub fn render(app: &App, screen: &mut Screen) {
     let _ = stdout.flush();
 }
 
+fn map_label(app: &App) -> String {
+    match app.map_subject() {
+        Some(s) => {
+            let known = if s.is_known() {
+                color::human_size(s.size())
+            } else {
+                "scanning…".to_string()
+            };
+            format!("map: {} ({})", s.path.display(), known)
+        }
+        None => "map".to_string(),
+    }
+}
+
 fn size_cell(known: bool, size: u64, done: u64, total: u64, tick: u64) -> String {
     if known {
         return color::human_size(size);
@@ -97,10 +149,12 @@ fn size_cell(known: bool, size: u64, done: u64, total: u64, tick: u64) -> String
     format!("{spin} {pct:>3}%")
 }
 
-fn draw_tree(app: &App, screen: &mut Screen, top: usize, height: usize) {
-    let cols = screen.cols;
+fn draw_tree(app: &App, screen: &mut Screen, x: usize, top: usize, width: usize, height: usize) {
+    if width == 0 || height == 0 {
+        return;
+    }
     let size_w: usize = 12;
-    let name_w = cols.saturating_sub(size_w + 2).max(1);
+    let name_w = width.saturating_sub(size_w + 2).max(1);
 
     let mut start = 0;
     if app.visible.len() > height && app.selected >= height {
@@ -116,7 +170,7 @@ fn draw_tree(app: &App, screen: &mut Screen, top: usize, height: usize) {
         let row = top + (i - start);
         let is_selected = i == app.selected;
         let size = size_cell(r.known, r.size, r.done, r.total, app.tick);
-        let size_x = name_w + 2;
+        let size_x = x + name_w + 2;
 
         if r.is_parent {
             let line = format!(
@@ -126,7 +180,7 @@ fn draw_tree(app: &App, screen: &mut Screen, top: usize, height: usize) {
             );
             let fg = if is_selected { (20, 20, 20) } else { (120, 140, 220) };
             let bg = if is_selected { (200, 200, 200) } else { DEFAULT_BG };
-            screen.put_str(0, row, &line, fg, bg);
+            screen.put_str(x, row, &line, fg, bg);
             continue;
         }
 
@@ -153,13 +207,13 @@ fn draw_tree(app: &App, screen: &mut Screen, top: usize, height: usize) {
                 width::pad(&name, name_w, false),
                 width::pad(&size, size_w, true)
             );
-            screen.put_str(0, row, &line, (20, 20, 20), (200, 200, 200));
+            screen.put_str(x, row, &line, (20, 20, 20), (200, 200, 200));
         } else {
             let pw = width::str_width(&r.prefix);
-            screen.put_str(0, row, &r.prefix, BRANCH_FG, DEFAULT_BG);
+            screen.put_str(x, row, &r.prefix, BRANCH_FG, DEFAULT_BG);
             let rest_raw = format!("{}{}", arrow, r.name);
             let rest = width::truncate(&rest_raw, name_w.saturating_sub(pw));
-            screen.put_str(pw, row, &rest, (fr, fg_, fb), DEFAULT_BG);
+            screen.put_str(x + pw, row, &rest, (fr, fg_, fb), DEFAULT_BG);
             let (sfr, sfg, sfb) = if r.known { (fr, fg_, fb) } else { (110, 140, 150) };
             screen.put_str(
                 size_x,
@@ -172,36 +226,34 @@ fn draw_tree(app: &App, screen: &mut Screen, top: usize, height: usize) {
     }
 }
 
+fn draw_vseparator(screen: &mut Screen, col: usize, top: usize, height: usize) {
+    for row in top..top + height {
+        screen.put(col, row, '│', CHROME_FG, DEFAULT_BG);
+    }
+}
+
 fn draw_separator(app: &App, screen: &mut Screen, row: usize) {
     let cols = screen.cols;
-    let label = match app.map_subject() {
-        Some(s) => {
-            let known = if s.is_known() {
-                color::human_size(s.size())
-            } else {
-                "scanning…".to_string()
-            };
-            format!(" map: {} ({}) ", s.path.display(), known)
-        }
-        None => " map ".to_string(),
-    };
+    let label = format!(" {} ", map_label(app));
     let head = format!("──{}", label);
     let used = width::str_width(&head);
     let fill = cols.saturating_sub(used);
     let mut line = head;
     line.push_str(&"─".repeat(fill));
     let line = width::truncate(&line, cols);
-    screen.put_str(0, row, &line, (130, 130, 140), DEFAULT_BG);
+    screen.put_str(0, row, &line, CHROME_FG, DEFAULT_BG);
 }
 
-fn draw_map(app: &App, screen: &mut Screen, top: usize, height: usize) {
-    let cols = screen.cols;
+fn draw_map(app: &App, screen: &mut Screen, x: usize, top: usize, width: usize, height: usize) {
+    if width == 0 || height == 0 {
+        return;
+    }
     match &app.map_layout {
-        Some(layout) => treemap::draw(screen, 0, top, cols, height, layout),
+        Some(layout) => treemap::draw(screen, x, top, width, height, layout),
         None => {
             let spin = SPINNER[(app.tick as usize) % 4];
             let msg = format!("{spin} computing map…");
-            let cx = cols.saturating_sub(width::str_width(&msg)) / 2;
+            let cx = x + width.saturating_sub(width::str_width(&msg)) / 2;
             let cy = top + height / 2;
             screen.put_str(cx, cy, &msg, (140, 140, 150), DEFAULT_BG);
         }

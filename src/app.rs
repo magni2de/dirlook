@@ -21,6 +21,34 @@ pub enum SortMode {
     SizeAsc,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum LayoutMode {
+    Vertical,
+    Horizontal,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Rect {
+    pub x: usize,
+    pub y: usize,
+    pub w: usize,
+    pub h: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum Divider {
+    Vertical(usize),
+    Horizontal(usize),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Regions {
+    pub mode: LayoutMode,
+    pub tree: Rect,
+    pub map: Rect,
+    pub divider: Divider,
+}
+
 #[derive(Debug, Clone)]
 pub struct VisibleRow {
     pub name: String,
@@ -70,6 +98,9 @@ pub struct App {
     pub cell_width: u32,
     pub show_legend: bool,
     pub tick: u64,
+    pub layout: LayoutMode,
+    pub split_v: usize,
+    pub split_h: usize,
 
     map_tx: Sender<MapRequest>,
     map_rx: Receiver<MapResult>,
@@ -121,6 +152,9 @@ impl App {
             cell_width: 1,
             show_legend: false,
             tick: 0,
+            layout: LayoutMode::Vertical,
+            split_v: 30,
+            split_h: 40,
             map_tx,
             map_rx,
             map_gen: 0,
@@ -185,6 +219,76 @@ impl App {
         }
     }
 
+    /// Compute the tree/map geometry for the current terminal size.
+    ///
+    /// Kept in one place so `ui::render` and the off-thread map builder in
+    /// `pump` always agree on the map's dimensions.
+    pub fn regions(&self, rows: usize, cols: usize) -> Regions {
+        match self.layout {
+            LayoutMode::Vertical => {
+                let content_h = rows.saturating_sub(2);
+                let max_tree = cols.saturating_sub(2).max(1);
+                let tree_w = (cols * self.split_v / 100).clamp(1, max_tree);
+                let map_x = tree_w + 1;
+                let map_w = cols.saturating_sub(map_x);
+                Regions {
+                    mode: LayoutMode::Vertical,
+                    tree: Rect {
+                        x: 0,
+                        y: 1,
+                        w: tree_w,
+                        h: content_h,
+                    },
+                    map: Rect {
+                        x: map_x,
+                        y: 1,
+                        w: map_w,
+                        h: content_h,
+                    },
+                    divider: Divider::Vertical(tree_w),
+                }
+            }
+            LayoutMode::Horizontal => {
+                let content_h = rows.saturating_sub(3);
+                let tree_h = (content_h * self.split_h / 100).max(2);
+                let map_h = content_h.saturating_sub(tree_h);
+                let sep_row = 1 + tree_h;
+                Regions {
+                    mode: LayoutMode::Horizontal,
+                    tree: Rect {
+                        x: 0,
+                        y: 1,
+                        w: cols,
+                        h: tree_h,
+                    },
+                    map: Rect {
+                        x: 0,
+                        y: sep_row + 1,
+                        w: cols,
+                        h: map_h,
+                    },
+                    divider: Divider::Horizontal(sep_row),
+                }
+            }
+        }
+    }
+
+    fn split_mut(&mut self) -> &mut usize {
+        match self.layout {
+            LayoutMode::Vertical => &mut self.split_v,
+            LayoutMode::Horizontal => &mut self.split_h,
+        }
+    }
+
+    fn force_map_rebuild(&mut self) {
+        let past = Instant::now()
+            .checked_sub(Duration::from_millis(500))
+            .unwrap_or_else(Instant::now);
+        if self.map_last_send > past {
+            self.map_last_send = past;
+        }
+    }
+
     pub fn handle_key(&mut self, code: KeyCode) {
         match code {
             KeyCode::Char('q') => self.quit = true,
@@ -244,6 +348,23 @@ impl App {
                     SortMode::SizeAsc => SortMode::Name,
                 };
                 self.refresh();
+            }
+            KeyCode::Char('m') => {
+                self.layout = match self.layout {
+                    LayoutMode::Vertical => LayoutMode::Horizontal,
+                    LayoutMode::Horizontal => LayoutMode::Vertical,
+                };
+                self.force_map_rebuild();
+            }
+            KeyCode::Char(']') => {
+                let s = self.split_mut();
+                *s = (*s + 5).min(85);
+                self.force_map_rebuild();
+            }
+            KeyCode::Char('[') => {
+                let s = self.split_mut();
+                *s = s.saturating_sub(5).max(15);
+                self.force_map_rebuild();
             }
             _ => {}
         }
@@ -456,6 +577,17 @@ impl App {
 
         let path = subject.path.clone();
 
+        // Fold the map's cell dimensions into the signature so a resize or a
+        // moved split boundary invalidates the cached layout instead of showing
+        // a stale map computed for the old geometry.
+        let (rows, cols) = crate::term::terminal_size();
+        let cell = self.cell_width.max(1) as usize;
+        let eff_cols = (cols as usize / cell).max(1);
+        let regions = self.regions(rows as usize, eff_cols);
+        let (w, h) = (regions.map.w.max(1), regions.map.h.max(1));
+        sig = (sig ^ w as u64).wrapping_mul(1099511628211);
+        sig = (sig ^ h as u64).wrapping_mul(1099511628211);
+
         // Cache hit: the same subject with an unchanged signature -> show now.
         if let Some((cached_sig, cached)) = self.map_cache.get(&path) {
             if *cached_sig == sig {
@@ -486,13 +618,6 @@ impl App {
         let due = self.map_last_send.elapsed() > Duration::from_millis(120);
 
         if subject_changed || (sig_changed && due) {
-            let (rows, cols) = crate::term::terminal_size();
-            let cell = self.cell_width.max(1) as usize;
-            let eff_cols = cols as usize / cell;
-            let content_h = (rows as usize).saturating_sub(3);
-            let tree_h = (content_h * 40 / 100).max(2);
-            let map_h = content_h.saturating_sub(tree_h);
-            let (w, h) = (eff_cols.max(1), map_h.max(1));
             if subject_changed {
                 self.map_layout = None;
             }
