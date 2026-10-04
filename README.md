@@ -96,8 +96,17 @@ method suits you, then verify the install with `dirlook --version`.
 
 ### Homebrew (macOS / Linux)
 
+Install straight from the tap in one command:
+
 ```sh
 brew install magni2de/dirlook/dirlook
+```
+
+Or add the tap first, then install by name:
+
+```sh
+brew tap magni2de/dirlook
+brew install dirlook
 ```
 
 ### Cargo (macOS / Linux)
