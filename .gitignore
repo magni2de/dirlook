@@ -5,11 +5,6 @@ node_modules/
 dist/
 *.log
 
-
 # Added by cargo
 
 /target
-
-# Assistant / editor config (not part of the project)
-.opencode/
-opencode.json

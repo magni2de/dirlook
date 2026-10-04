@@ -22,28 +22,6 @@ on the Rust standard library plus a small amount of POSIX FFI.
 
 ---
 
-## 🚀 Quick start
-
-```sh
-# clone and build
-git clone https://github.com/magni2de/dirlook
-cd dirlook
-cargo build --release
-
-# run it on a directory (defaults to the current directory)
-./target/release/dirlook ~/Downloads
-```
-
-Or grab the published crate in one step: `cargo install --locked dirlook` (see [Install](#-install)).
-
-During development you can build and run in one step:
-
-```sh
-cargo run --release -- ~/Downloads
-```
-
----
-
 ## ✨ Features
 
 - **Tree view** with sizes, tree-branch guides, expand/collapse, and `Enter` to
@@ -64,6 +42,34 @@ cargo run --release -- ~/Downloads
 - **Zero dependencies** — pure `std` + POSIX FFI (`termios`, `poll`, `ioctl`, `read`).
 - **Double-buffered rendering** — only the cells that changed are redrawn, so the
   UI updates without flicker.
+
+## ⚡ Performance & caching
+
+- **Live, multi-threaded scan** — the walk runs on a pool of worker threads
+  (`min(logical CPUs, 8)`). The directory the cursor is on is scanned first (a
+  priority queue); everything else follows on spare capacity. The UI never blocks.
+- **Instant first paint** — dirlook waits briefly (up to a second) for the root's
+  listing before drawing the first frame, so the very first screen is already full;
+  sizes then stream in live.
+- **In-memory map cache** — every built treemap is cached under `(path + a
+  signature of its children)`. Navigating away and back reuses it instantly, and it
+  is only rebuilt when the sizes actually change. The cache lives only for the
+  session — nothing is written to disk.
+- **Off the critical path** — treemaps are laid out in a dedicated thread; small
+  directories are computed synchronously in the same frame (no flicker), while very
+  large ones show a spinner until ready.
+
+## 🔧 How it works
+
+- **Terminal** — raw mode via `cfmakeraw`, non-blocking input via `poll`, and
+  single-byte reads straight from `fd 0`. The reads are unbuffered on purpose:
+  going through the buffered standard input would swallow the whole escape
+  sequence and hide the remaining bytes from `poll`, which makes a single arrow
+  press look like a bare `Esc`.
+- **Tree** — nodes are shared (`Arc`) and updated live through atomics, so the scan
+  threads and the UI see the same tree without locking on the hot path.
+- **Rendering** — a double-buffered screen emits only the changed cells each frame,
+  and the app runs on the terminal's alternate screen.
 
 ---
 
@@ -96,15 +102,23 @@ cargo install --locked dirlook
 
 ### Prebuilt binaries
 
-Download the archive for your platform from the
-[Releases](https://github.com/magni2de/dirlook/releases) page (the file name
-contains the version, e.g. `dirlook-v0.3.0-macos-arm64.tar.gz`), unpack it, and
-put `dirlook` somewhere on your `PATH`:
+No package manager needed — grab the archive for your platform:
+
+| Platform | Download |
+| --- | --- |
+| macOS · Apple Silicon (arm64) | [`dirlook-v0.3.0-macos-arm64.tar.gz`](https://github.com/magni2de/dirlook/releases/download/v0.3.0/dirlook-v0.3.0-macos-arm64.tar.gz) |
+| macOS · Intel (x86_64) | [`dirlook-v0.3.0-macos-x86_64.tar.gz`](https://github.com/magni2de/dirlook/releases/download/v0.3.0/dirlook-v0.3.0-macos-x86_64.tar.gz) |
+| Linux · x86_64 | [`dirlook-v0.3.0-linux-x86_64.tar.gz`](https://github.com/magni2de/dirlook/releases/download/v0.3.0/dirlook-v0.3.0-linux-x86_64.tar.gz) |
+| Linux · arm64 | [`dirlook-v0.3.0-linux-arm64.tar.gz`](https://github.com/magni2de/dirlook/releases/download/v0.3.0/dirlook-v0.3.0-linux-arm64.tar.gz) |
+
+Then unpack it and put `dirlook` somewhere on your `PATH`:
 
 ```sh
 tar xzf dirlook-v0.3.0-macos-arm64.tar.gz
 sudo mv dirlook /usr/local/bin/
 ```
+
+All versions are listed on the [Releases](https://github.com/magni2de/dirlook/releases) page.
 
 ### From source
 
@@ -132,8 +146,6 @@ dirlook [OPTIONS] [PATH]
 
 Running `dirlook` with no arguments analyzes the current directory.
 
----
-
 ## ⌨️ Keys
 
 | Key | Action |
@@ -146,40 +158,6 @@ Running `dirlook` with no arguments analyzes the current directory.
 | `/` | Toggle the color legend |
 | `q` | Quit |
 
----
-
-## ⚡ Performance & caching
-
-- **Live, multi-threaded scan** — the walk runs on a pool of worker threads
-  (`min(logical CPUs, 8)`). The directory the cursor is on is scanned first (a
-  priority queue); everything else follows on spare capacity. The UI never blocks.
-- **Instant first paint** — dirlook waits briefly (up to a second) for the root's
-  listing before drawing the first frame, so the very first screen is already full;
-  sizes then stream in live.
-- **In-memory map cache** — every built treemap is cached under `(path + a
-  signature of its children)`. Navigating away and back reuses it instantly, and it
-  is only rebuilt when the sizes actually change. The cache lives only for the
-  session — nothing is written to disk.
-- **Off the critical path** — treemaps are laid out in a dedicated thread; small
-  directories are computed synchronously in the same frame (no flicker), while very
-  large ones show a spinner until ready.
-
----
-
-## 🔧 How it works
-
-- **Terminal** — raw mode via `cfmakeraw`, non-blocking input via `poll`, and
-  single-byte reads straight from `fd 0`. The reads are unbuffered on purpose:
-  going through the buffered standard input would swallow the whole escape
-  sequence and hide the remaining bytes from `poll`, which makes a single arrow
-  press look like a bare `Esc`.
-- **Tree** — nodes are shared (`Arc`) and updated live through atomics, so the scan
-  threads and the UI see the same tree without locking on the hot path.
-- **Rendering** — a double-buffered screen emits only the changed cells each frame,
-  and the app runs on the terminal's alternate screen.
-
----
-
 ## 🌍 Platform support
 
 | Platform | Status |
@@ -187,8 +165,6 @@ Running `dirlook` with no arguments analyzes the current directory.
 | macOS (arm64, x86_64) | Supported |
 | Linux (x86_64, aarch64) | Supported |
 | Windows | Not supported |
-
----
 
 ## 📄 License
 
