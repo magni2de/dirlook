@@ -1,5 +1,11 @@
 # dirlook
 
+[![crates.io](https://img.shields.io/crates/v/dirlook.svg)](https://crates.io/crates/dirlook)
+[![downloads](https://img.shields.io/crates/d/dirlook.svg)](https://crates.io/crates/dirlook)
+[![license](https://img.shields.io/crates/l/dirlook.svg)](#-license)
+[![platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-blue)](#-platform-support)
+[![CI](https://github.com/magni2de/dirlook/actions/workflows/ci.yml/badge.svg)](https://github.com/magni2de/dirlook/actions/workflows/ci.yml)
+
 > A fast, zero-dependency terminal disk usage analyzer with a tree view and a
 > treemap, written in Rust.
 
@@ -14,7 +20,9 @@
 No external crates and no config files: it is a single self-contained binary built
 on the Rust standard library plus a small amount of POSIX FFI.
 
-## Quick start
+---
+
+## 🚀 Quick start
 
 ```sh
 # clone and build
@@ -26,13 +34,17 @@ cargo build --release
 ./target/release/dirlook ~/Downloads
 ```
 
+Or grab the published crate in one step: `cargo install --locked dirlook` (see [Install](#-install)).
+
 During development you can build and run in one step:
 
 ```sh
 cargo run --release -- ~/Downloads
 ```
 
-## Features
+---
+
+## ✨ Features
 
 - **Tree view** with sizes, tree-branch guides, expand/collapse, and `Enter` to
   dive into a folder.
@@ -53,25 +65,46 @@ cargo run --release -- ~/Downloads
 - **Double-buffered rendering** — only the cells that changed are redrawn, so the
   UI updates without flicker.
 
-## Screenshots
+---
+
+## 🖼️ Screenshots
 
 Color legend (`/`):
 
 ![legend](screenshots/legend.png)
 
-## Install
+---
 
-### Homebrew
+## 📦 Install
+
+`dirlook` runs on macOS and Linux (Windows is not supported). Pick whichever
+method suits you, then verify the install with `dirlook --version`.
+
+### Homebrew (macOS / Linux)
 
 ```sh
 brew install magni2de/dirlook/dirlook
 ```
 
+### Cargo (macOS / Linux)
+
+Requires a Rust toolchain — install it from [rustup.rs](https://rustup.rs).
+
+```sh
+cargo install --locked dirlook
+```
+
 ### Prebuilt binaries
 
 Download the archive for your platform from the
-[Releases](https://github.com/magni2de/dirlook/releases) page, unpack it and put
-`dirlook` somewhere on your `PATH`.
+[Releases](https://github.com/magni2de/dirlook/releases) page (the file name
+contains the version, e.g. `dirlook-v0.3.0-macos-arm64.tar.gz`), unpack it, and
+put `dirlook` somewhere on your `PATH`:
+
+```sh
+tar xzf dirlook-v0.3.0-macos-arm64.tar.gz
+sudo mv dirlook /usr/local/bin/
+```
 
 ### From source
 
@@ -82,13 +115,9 @@ cargo build --release
 # binary at target/release/dirlook
 ```
 
-### With cargo
+---
 
-```sh
-cargo install dirlook
-```
-
-## Usage
+## 🎮 Usage
 
 ```
 dirlook [OPTIONS] [PATH]
@@ -103,7 +132,9 @@ dirlook [OPTIONS] [PATH]
 
 Running `dirlook` with no arguments analyzes the current directory.
 
-## Keys
+---
+
+## ⌨️ Keys
 
 | Key | Action |
 | --- | --- |
@@ -115,7 +146,9 @@ Running `dirlook` with no arguments analyzes the current directory.
 | `/` | Toggle the color legend |
 | `q` | Quit |
 
-## Performance & caching
+---
+
+## ⚡ Performance & caching
 
 - **Live, multi-threaded scan** — the walk runs on a pool of worker threads
   (`min(logical CPUs, 8)`). The directory the cursor is on is scanned first (a
@@ -131,7 +164,9 @@ Running `dirlook` with no arguments analyzes the current directory.
   directories are computed synchronously in the same frame (no flicker), while very
   large ones show a spinner until ready.
 
-## How it works
+---
+
+## 🔧 How it works
 
 - **Terminal** — raw mode via `cfmakeraw`, non-blocking input via `poll`, and
   single-byte reads straight from `fd 0`. The reads are unbuffered on purpose:
@@ -143,7 +178,9 @@ Running `dirlook` with no arguments analyzes the current directory.
 - **Rendering** — a double-buffered screen emits only the changed cells each frame,
   and the app runs on the terminal's alternate screen.
 
-## Platform support
+---
+
+## 🌍 Platform support
 
 | Platform | Status |
 | --- | --- |
@@ -151,7 +188,9 @@ Running `dirlook` with no arguments analyzes the current directory.
 | Linux (x86_64, aarch64) | Supported |
 | Windows | Not supported |
 
-## License
+---
+
+## 📄 License
 
 Licensed under either of
 
