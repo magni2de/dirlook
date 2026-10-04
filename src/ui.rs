@@ -157,10 +157,10 @@ fn draw_tree(app: &App, screen: &mut Screen, x: usize, top: usize, width: usize,
     let name_w = width.saturating_sub(size_w + 2).max(1);
 
     let mut start = 0;
-    if app.visible.len() > height && app.selected >= height {
-        start = app.selected - height / 2 + 1;
+    if app.visible.len() > height {
+        start = app.selected.saturating_sub(height / 2);
         if start + height > app.visible.len() {
-            start = app.visible.len().saturating_sub(height);
+            start = app.visible.len() - height;
         }
     }
     let end = (start + height).min(app.visible.len());
