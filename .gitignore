@@ -8,3 +8,5 @@ dist/
 # Added by cargo
 
 /target
+
+AGENTS.md

@@ -5,7 +5,7 @@
 # Usage:
 #   scripts/release.sh X.Y.Z [--dry-run] [--yes]
 #
-# Run from the repository root on a clean `main`. See AGENTS.md for details.
+# Run from the repository root on a clean `main`.
 set -euo pipefail
 
 REPO_SLUG="magni2de/dirlook"

@@ -10,5 +10,6 @@ homepage = "https://github.com/magni2de/dirlook"
 readme = "README.md"
 keywords = ["disk-usage", "tui", "treemap", "terminal", "du"]
 categories = ["command-line-utilities", "filesystem"]
+exclude = ["AGENTS.md"]
 
 [dependencies]
