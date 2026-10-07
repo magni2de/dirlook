@@ -78,7 +78,7 @@ fn main() {
 }
 
 fn print_version() {
-    println!("dirlook {}", env!("CARGO_PKG_VERSION"));
+    println!("dirlook v{}", env!("CARGO_PKG_VERSION"));
 }
 
 fn print_help() {

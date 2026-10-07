@@ -52,6 +52,18 @@ confirm() {
   esac
 }
 
+# Print the CHANGELOG.md section for the given version (X.Y.Z), without the
+# heading line. Exits non-zero when there is no section for that version.
+changelog_section() {
+  local file="$REPO_ROOT/CHANGELOG.md"
+  [ -f "$file" ] || return 1
+  awk -v hdr="## [$1]" '
+    index($0, hdr) == 1 { found = 1; next }
+    found && /^## / { exit }
+    found { print }
+  ' "$file"
+}
+
 for arg in "$@"; do
   case "$arg" in
     --dry-run) DRY_RUN=1 ;;
@@ -112,6 +124,21 @@ else
   done
   [ "${count:-0}" -ge 4 ] || die "release assets did not appear in time (see: gh run list)"
   echo "release assets ready: $count"
+fi
+
+log "4b/7 Attach changelog as release notes"
+if notes="$(changelog_section "$VERSION")" && [ -n "$notes" ]; then
+  printf '%s\n' "$notes"
+  if [ "$DRY_RUN" = 1 ]; then
+    echo "DRY-RUN: gh release edit $TAG --notes-file <CHANGELOG section>"
+  elif confirm "Set the GitHub release notes for $TAG from CHANGELOG.md?"; then
+    notes_file="$(mktemp)"
+    printf '%s\n' "$notes" >"$notes_file"
+    gh release edit "$TAG" --notes-file "$notes_file"
+    rm -f "$notes_file"
+  fi
+else
+  echo "warning: no CHANGELOG.md section for $VERSION; skipping release notes"
 fi
 
 log "5/7 Publish to crates.io"

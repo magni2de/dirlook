@@ -1,6 +1,9 @@
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
+
+/// How many times a permission-denied directory is retried while the app runs.
+pub const DEFAULT_DIR_RETRIES: u32 = 150;
 
 /// A node of the live filesystem tree. Directories start with an unknown size
 /// and are filled in by the background scan engine. All mutation is atomic (or
@@ -18,6 +21,12 @@ pub struct Node {
     pub queued: AtomicBool,
     /// Whether this directory's immediate children have been listed.
     pub listed: AtomicBool,
+    /// Whether listing this directory failed due to missing permission.
+    pub denied: AtomicBool,
+    /// Remaining background retries for a permission-denied directory.
+    pub retries: AtomicU32,
+    /// Whether this node's size has already been added to its parent.
+    pub counted: AtomicBool,
     /// Number of sub-directories still being scanned.
     pub remaining: AtomicU64,
     /// Accumulated bytes from processed children (directories).
@@ -39,6 +48,9 @@ impl Node {
             parent: Mutex::new(None),
             queued: AtomicBool::new(true),
             listed: AtomicBool::new(true),
+            denied: AtomicBool::new(false),
+            retries: AtomicU32::new(0),
+            counted: AtomicBool::new(false),
             remaining: AtomicU64::new(0),
             acc: AtomicU64::new(size),
             total_entries: AtomicU64::new(0),
@@ -57,6 +69,9 @@ impl Node {
             parent: Mutex::new(None),
             queued: AtomicBool::new(false),
             listed: AtomicBool::new(false),
+            denied: AtomicBool::new(false),
+            retries: AtomicU32::new(DEFAULT_DIR_RETRIES),
+            counted: AtomicBool::new(false),
             remaining: AtomicU64::new(0),
             acc: AtomicU64::new(0),
             total_entries: AtomicU64::new(0),
@@ -74,6 +89,10 @@ impl Node {
 
     pub fn is_known(&self) -> bool {
         self.known.load(Ordering::Relaxed)
+    }
+
+    pub fn is_denied(&self) -> bool {
+        self.denied.load(Ordering::Relaxed)
     }
 
     pub fn child_list(&self) -> Vec<Arc<Node>> {

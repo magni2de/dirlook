@@ -4,15 +4,19 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::node::Node;
 
 pub type Index = Arc<Mutex<HashMap<PathBuf, Arc<Node>>>>;
 
+/// Delay between background retries of a permission-denied directory.
+const RETRY_DELAY: Duration = Duration::from_secs(2);
+
 struct Queue {
     high: Mutex<VecDeque<Arc<Node>>>,
     low: Mutex<VecDeque<Arc<Node>>>,
+    retries: Mutex<Vec<(Instant, Arc<Node>)>>,
     cancel: AtomicBool,
 }
 
@@ -34,6 +38,30 @@ impl Queue {
             return Some(n);
         }
         self.low.lock().unwrap().pop_front()
+    }
+
+    fn schedule_retry(&self, node: Arc<Node>, at: Instant) {
+        self.retries.lock().unwrap().push((at, node));
+    }
+
+    fn repush_due(&self) {
+        let now = Instant::now();
+        let mut due = Vec::new();
+        {
+            let mut r = self.retries.lock().unwrap();
+            let mut kept = Vec::with_capacity(r.len());
+            for (at, n) in r.drain(..) {
+                if at <= now {
+                    due.push(n);
+                } else {
+                    kept.push((at, n));
+                }
+            }
+            *r = kept;
+        }
+        for n in due {
+            self.push(n, false);
+        }
     }
 }
 
@@ -77,6 +105,7 @@ pub fn bootstrap(root_path: PathBuf) -> Engine {
     let queue = Arc::new(Queue {
         high: Mutex::new(VecDeque::new()),
         low: Mutex::new(VecDeque::new()),
+        retries: Mutex::new(Vec::new()),
         cancel: AtomicBool::new(false),
     });
     queue.push(Arc::clone(&root), true);
@@ -106,6 +135,7 @@ fn worker(queue: Arc<Queue>, index: Index) {
         if queue.cancel.load(Ordering::Relaxed) {
             return;
         }
+        queue.repush_due();
         match queue.pop() {
             Some(node) => process_dir(&node, &queue, &index),
             None => thread::sleep(Duration::from_millis(2)),
@@ -115,10 +145,23 @@ fn worker(queue: Arc<Queue>, index: Index) {
 
 fn process_dir(node: &Arc<Node>, queue: &Arc<Queue>, index: &Index) {
     let entries: Vec<fs::DirEntry> = match fs::read_dir(&node.path) {
-        Ok(it) => it.filter_map(Result::ok).collect(),
-        Err(_) => {
+        Ok(it) => {
+            node.denied.store(false, Ordering::Relaxed);
+            it.filter_map(Result::ok).collect()
+        }
+        Err(e) => {
             node.listed.store(true, Ordering::Relaxed);
-            finalize(node);
+            if e.kind() == std::io::ErrorKind::PermissionDenied {
+                node.denied.store(true, Ordering::Relaxed);
+                finalize(node);
+                if node.retries.load(Ordering::Relaxed) > 0 {
+                    node.retries.fetch_sub(1, Ordering::Relaxed);
+                    node.queued.store(false, Ordering::Relaxed);
+                    queue.schedule_retry(Arc::clone(node), Instant::now() + RETRY_DELAY);
+                }
+            } else {
+                finalize(node);
+            }
             return;
         }
     };
@@ -175,7 +218,8 @@ fn process_dir(node: &Arc<Node>, queue: &Arc<Queue>, index: &Index) {
 fn finalize(node: &Arc<Node>) {
     let mut cur = Arc::clone(node);
     loop {
-        cur.size.store(cur.acc.load(Ordering::Relaxed), Ordering::Relaxed);
+        let size = cur.acc.load(Ordering::Relaxed);
+        cur.size.store(size, Ordering::Relaxed);
         cur.known.store(true, Ordering::Relaxed);
 
         let parent = cur
@@ -187,12 +231,37 @@ fn finalize(node: &Arc<Node>) {
         let Some(p) = parent else {
             break;
         };
-        p.acc.fetch_add(cur.size.load(Ordering::Relaxed), Ordering::Relaxed);
+
+        if cur.counted.swap(true, Ordering::SeqCst) {
+            propagate(p, size);
+            break;
+        }
+
+        p.acc.fetch_add(size, Ordering::Relaxed);
         p.done_entries.fetch_add(1, Ordering::Relaxed);
         if p.remaining.fetch_sub(1, Ordering::Relaxed) == 1 {
             cur = p;
         } else {
             break;
+        }
+    }
+}
+
+/// Add a size delta to a node and all of its ancestors. Used when a previously
+/// finalized (permission-denied) directory is finally scanned successfully.
+fn propagate(mut node: Arc<Node>, delta: u64) {
+    loop {
+        node.acc.fetch_add(delta, Ordering::Relaxed);
+        node.size.fetch_add(delta, Ordering::Relaxed);
+        let parent = node
+            .parent
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|w| w.upgrade());
+        match parent {
+            Some(p) => node = p,
+            None => break,
         }
     }
 }
@@ -221,6 +290,108 @@ mod tests {
         assert_eq!(root.size(), 6000);
 
         drop(engine);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn engine_marks_denied_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = std::env::temp_dir().join("dirlook_denied_test");
+        let _ = fs::set_permissions(
+            base.join("locked"),
+            fs::Permissions::from_mode(0o700),
+        );
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("locked")).unwrap();
+        fs::write(base.join("locked/secret.bin"), vec![0u8; 100]).unwrap();
+        let locked_path = base.join("locked");
+        fs::set_permissions(&locked_path, fs::Permissions::from_mode(0o000)).unwrap();
+
+        if fs::read_dir(&locked_path).is_ok() {
+            let _ = fs::set_permissions(&locked_path, fs::Permissions::from_mode(0o700));
+            let _ = fs::remove_dir_all(&base);
+            return;
+        }
+
+        let engine = bootstrap(base.clone());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut locked = None;
+        while Instant::now() < deadline {
+            for child in engine.root.child_list() {
+                if child.name == "locked" && child.is_known() {
+                    locked = Some(child);
+                    break;
+                }
+            }
+            if locked.is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        drop(engine);
+        let _ = fs::set_permissions(&locked_path, fs::Permissions::from_mode(0o700));
+        let _ = fs::remove_dir_all(&base);
+
+        let locked = locked.expect("locked directory not finalized in time");
+        assert!(locked.is_denied(), "locked directory should be marked denied");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn engine_retries_denied_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = std::env::temp_dir().join("dirlook_retry_test");
+        let _ = fs::set_permissions(
+            base.join("locked"),
+            fs::Permissions::from_mode(0o700),
+        );
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("locked")).unwrap();
+        fs::write(base.join("locked/secret.bin"), vec![0u8; 100]).unwrap();
+        let locked_path = base.join("locked");
+        fs::set_permissions(&locked_path, fs::Permissions::from_mode(0o000)).unwrap();
+
+        if fs::read_dir(&locked_path).is_ok() {
+            let _ = fs::set_permissions(&locked_path, fs::Permissions::from_mode(0o700));
+            let _ = fs::remove_dir_all(&base);
+            return;
+        }
+
+        let engine = bootstrap(base.clone());
+        let root = Arc::clone(&engine.root);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut locked = None;
+        while Instant::now() < deadline {
+            for child in root.child_list() {
+                if child.name == "locked" && child.is_denied() {
+                    locked = Some(child);
+                    break;
+                }
+            }
+            if locked.is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let locked = locked.expect("locked directory not marked denied in time");
+        assert_eq!(locked.size(), 0);
+
+        fs::set_permissions(&locked_path, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while (!locked.is_known() || locked.size() != 100) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!locked.is_denied(), "denied flag should clear after retry");
+        assert_eq!(locked.size(), 100, "retry should pick up the real size");
+        assert_eq!(root.size(), 100, "retry size should propagate to ancestors");
+
+        drop(engine);
+        let _ = fs::set_permissions(&locked_path, fs::Permissions::from_mode(0o700));
         let _ = fs::remove_dir_all(&base);
     }
 }

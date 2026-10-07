@@ -102,6 +102,11 @@ pub fn render(app: &App, screen: &mut Screen) {
         color::human_size(focus_size),
         sort
     );
+    let status = if selected.map(|r| r.denied).unwrap_or(false) {
+        " permission denied — allow access to this folder in System Settings > Privacy & Security > Files and Folders, then restart".to_string()
+    } else {
+        status
+    };
     screen.put_str(
         0,
         status_row,
@@ -125,7 +130,9 @@ pub fn render(app: &App, screen: &mut Screen) {
 fn map_label(app: &App) -> String {
     match app.map_subject() {
         Some(s) => {
-            let known = if s.is_known() {
+            let known = if s.is_denied() {
+                "permission denied".to_string()
+            } else if s.is_known() {
                 color::human_size(s.size())
             } else {
                 "scanning…".to_string()
@@ -169,7 +176,11 @@ fn draw_tree(app: &App, screen: &mut Screen, x: usize, top: usize, width: usize,
         let r = &app.visible[i];
         let row = top + (i - start);
         let is_selected = i == app.selected;
-        let size = size_cell(r.known, r.size, r.done, r.total, app.tick);
+        let size = if r.denied {
+            "denied".to_string()
+        } else {
+            size_cell(r.known, r.size, r.done, r.total, app.tick)
+        };
         let size_x = x + name_w + 2;
 
         if r.is_parent {
@@ -214,7 +225,13 @@ fn draw_tree(app: &App, screen: &mut Screen, x: usize, top: usize, width: usize,
             let rest_raw = format!("{}{}", arrow, r.name);
             let rest = width::truncate(&rest_raw, name_w.saturating_sub(pw));
             screen.put_str(x + pw, row, &rest, (fr, fg_, fb), DEFAULT_BG);
-            let (sfr, sfg, sfb) = if r.known { (fr, fg_, fb) } else { (110, 140, 150) };
+            let (sfr, sfg, sfb) = if r.denied {
+                (230, 120, 80)
+            } else if r.known {
+                (fr, fg_, fb)
+            } else {
+                (110, 140, 150)
+            };
             screen.put_str(
                 size_x,
                 row,
