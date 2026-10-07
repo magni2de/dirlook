@@ -138,15 +138,15 @@ No package manager needed — grab the archive for your platform:
 
 | Platform | Download |
 | --- | --- |
-| macOS · Apple Silicon (arm64) | [`dirlook-v0.4.1-macos-arm64.tar.gz`](https://github.com/magni2de/dirlook/releases/download/v0.4.1/dirlook-v0.4.1-macos-arm64.tar.gz) |
-| macOS · Intel (x86_64) | [`dirlook-v0.4.1-macos-x86_64.tar.gz`](https://github.com/magni2de/dirlook/releases/download/v0.4.1/dirlook-v0.4.1-macos-x86_64.tar.gz) |
-| Linux · x86_64 | [`dirlook-v0.4.1-linux-x86_64.tar.gz`](https://github.com/magni2de/dirlook/releases/download/v0.4.1/dirlook-v0.4.1-linux-x86_64.tar.gz) |
-| Linux · arm64 | [`dirlook-v0.4.1-linux-arm64.tar.gz`](https://github.com/magni2de/dirlook/releases/download/v0.4.1/dirlook-v0.4.1-linux-arm64.tar.gz) |
+| macOS · Apple Silicon (arm64) | [`dirlook-v0.4.2-macos-arm64.tar.gz`](https://github.com/magni2de/dirlook/releases/download/v0.4.2/dirlook-v0.4.2-macos-arm64.tar.gz) |
+| macOS · Intel (x86_64) | [`dirlook-v0.4.2-macos-x86_64.tar.gz`](https://github.com/magni2de/dirlook/releases/download/v0.4.2/dirlook-v0.4.2-macos-x86_64.tar.gz) |
+| Linux · x86_64 | [`dirlook-v0.4.2-linux-x86_64.tar.gz`](https://github.com/magni2de/dirlook/releases/download/v0.4.2/dirlook-v0.4.2-linux-x86_64.tar.gz) |
+| Linux · arm64 | [`dirlook-v0.4.2-linux-arm64.tar.gz`](https://github.com/magni2de/dirlook/releases/download/v0.4.2/dirlook-v0.4.2-linux-arm64.tar.gz) |
 
 Then unpack it and put `dirlook` somewhere on your `PATH`:
 
 ```sh
-tar xzf dirlook-v0.4.1-macos-arm64.tar.gz
+tar xzf dirlook-v0.4.2-macos-arm64.tar.gz
 sudo mv dirlook /usr/local/bin/
 ```
 
