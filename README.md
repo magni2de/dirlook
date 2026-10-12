@@ -48,6 +48,8 @@ on the Rust standard library plus a small amount of POSIX FFI.
   in from the background, so you can keep navigating, expanding and entering folders
   while the scan runs. Unknown sizes show a spinner in the tree and pale `?` blocks
   in the map.
+- **Refresh the current folder** — press `r` to refresh it now, or `w` to turn on
+  auto-refresh (off by default) and keep it current.
 - **Parallel scan** — a worker pool scans the tree concurrently, prioritizing the
   directory the cursor is on.
 - **In-memory map cache** — a treemap built once is reused instantly when you come
@@ -98,9 +100,9 @@ on the Rust standard library plus a small amount of POSIX FFI.
 
 ![stacked layout](screenshots/stacked.png)
 
-Color legend (`/`):
+**Help** (`?`) — hotkeys on the left, colors on the right:
 
-![legend](screenshots/legend.png)
+![help](screenshots/help.png)
 
 ---
 
@@ -200,7 +202,9 @@ Press `m` to toggle. Each layout remembers its own split — 30/70 side-by-side 
 | `s` | Cycle sort order (name / size) |
 | `[` / `]` | Move the tree/map divider — left/right side-by-side, up/down stacked |
 | `m` | Toggle layout (side-by-side / stacked) |
-| `/` | Toggle the color legend |
+| `r` | Refresh the current folder now |
+| `w` | Toggle auto-refresh of the current folder (off by default; `↻ watching` badge when on) |
+| `?` / `/` | Help — hotkeys and the color legend |
 | `q` | Quit |
 
 ## 🌍 Platform support

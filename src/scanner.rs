@@ -83,6 +83,112 @@ impl Engine {
     }
 }
 
+/// Replace the children of `live` with `shadow`'s subtree, fixing the index and
+/// the ancestor sizes. Returns true if anything actually changed.
+///
+/// `live` keeps its identity (and stays `known`), so the view never flickers
+/// into a "scanning" state — this is the atomic swap behind auto-refresh.
+pub fn splice(index: &Index, live: &Arc<Node>, shadow: &Arc<Node>) -> bool {
+    if !children_changed(live, shadow) {
+        return false;
+    }
+
+    let old_size = live.size();
+    let new_size = shadow.size();
+
+    {
+        let mut idx = index.lock().unwrap();
+        remove_index_subtree(live, &mut idx);
+    }
+    detach_subtree(live);
+    live.children.lock().unwrap().clear();
+
+    let new_children = shadow.child_list();
+    {
+        let mut idx = index.lock().unwrap();
+        for c in &new_children {
+            adopt_subtree(&mut idx, c, live);
+        }
+    }
+    *live.children.lock().unwrap() = new_children;
+
+    // Fold the size difference into every ancestor.
+    let delta = new_size as i64 - old_size as i64;
+    if delta != 0 {
+        let mut parent = live.parent.lock().unwrap().as_ref().and_then(|w| w.upgrade());
+        while let Some(p) = parent {
+            let acc = (p.acc.load(Ordering::Relaxed) as i64 + delta).max(0) as u64;
+            p.acc.store(acc, Ordering::Relaxed);
+            let size = (p.size.load(Ordering::Relaxed) as i64 + delta).max(0) as u64;
+            p.size.store(size, Ordering::Relaxed);
+            parent = p.parent.lock().unwrap().as_ref().and_then(|w| w.upgrade());
+        }
+    }
+
+    let total = shadow.total_entries.load(Ordering::Relaxed);
+    live.acc.store(new_size, Ordering::Relaxed);
+    live.size.store(new_size, Ordering::Relaxed);
+    live.known.store(true, Ordering::Relaxed);
+    live.listed.store(true, Ordering::Relaxed);
+    live.denied.store(shadow.denied.load(Ordering::Relaxed), Ordering::Relaxed);
+    live.total_entries.store(total, Ordering::Relaxed);
+    live.done_entries.store(total, Ordering::Relaxed);
+    live.remaining.store(0, Ordering::Relaxed);
+    true
+}
+
+/// Whether `shadow`'s immediate children differ from `live`'s (order-insensitive).
+fn children_changed(live: &Arc<Node>, shadow: &Arc<Node>) -> bool {
+    if live.size() != shadow.size() {
+        return true;
+    }
+    let key = |c: &Arc<Node>| {
+        (
+            c.name.clone(),
+            c.is_dir,
+            c.size(),
+            c.known.load(Ordering::Relaxed),
+        )
+    };
+    let mut a: Vec<_> = live.child_list().iter().map(key).collect();
+    let mut b: Vec<_> = shadow.child_list().iter().map(key).collect();
+    a.sort();
+    b.sort();
+    a != b
+}
+
+/// Remove every descendant of `root` (not `root` itself) from the index.
+fn remove_index_subtree(root: &Arc<Node>, idx: &mut HashMap<PathBuf, Arc<Node>>) {
+    let mut stack = root.child_list();
+    while let Some(n) = stack.pop() {
+        idx.remove(&n.path);
+        stack.extend(n.child_list());
+    }
+}
+
+/// Detach every descendant of `root` from its parent, so a worker that is still
+/// finalizing a node from the discarded subtree cannot add a stale size back.
+fn detach_subtree(root: &Arc<Node>) {
+    let mut stack = root.child_list();
+    while let Some(n) = stack.pop() {
+        *n.parent.lock().unwrap() = None;
+        n.counted.store(true, Ordering::Relaxed);
+        stack.extend(n.child_list());
+    }
+}
+
+/// Re-parent a shadow subtree under `parent` and index every node in it.
+fn adopt_subtree(idx: &mut HashMap<PathBuf, Arc<Node>>, node: &Arc<Node>, parent: &Arc<Node>) {
+    let mut stack = vec![(Arc::clone(node), Arc::clone(parent))];
+    while let Some((n, p)) = stack.pop() {
+        *n.parent.lock().unwrap() = Some(Arc::downgrade(&p));
+        idx.insert(n.path.clone(), Arc::clone(&n));
+        for c in n.child_list() {
+            stack.push((c, Arc::clone(&n)));
+        }
+    }
+}
+
 impl Drop for Engine {
     fn drop(&mut self) {
         self.queue.cancel.store(true, Ordering::Relaxed);
@@ -93,6 +199,20 @@ impl Drop for Engine {
 }
 
 pub fn bootstrap(root_path: PathBuf) -> Engine {
+    let workers = thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .clamp(1, 8);
+    bootstrap_with(root_path, workers)
+}
+
+/// Like [`bootstrap`], but with an explicit worker count — used for the light
+/// background refresh scans so they do not spawn a full pool every time.
+pub fn bootstrap_n(root_path: PathBuf, workers: usize) -> Engine {
+    bootstrap_with(root_path, workers.clamp(1, 8))
+}
+
+fn bootstrap_with(root_path: PathBuf, workers: usize) -> Engine {
     let canon = fs::canonicalize(&root_path).unwrap_or(root_path);
     let name = canon
         .file_name()
@@ -109,11 +229,6 @@ pub fn bootstrap(root_path: PathBuf) -> Engine {
         cancel: AtomicBool::new(false),
     });
     queue.push(Arc::clone(&root), true);
-
-    let workers = thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
-        .clamp(1, 8);
 
     let mut handles = Vec::with_capacity(workers);
     for _ in 0..workers {
@@ -337,6 +452,46 @@ mod tests {
 
         let locked = locked.expect("locked directory not finalized in time");
         assert!(locked.is_denied(), "locked directory should be marked denied");
+    }
+
+    #[test]
+    fn splice_swaps_in_rescanned_subtree() {
+        fn wait_known(node: &Arc<Node>) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !node.is_known() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
+            assert!(node.is_known(), "node not finalized in time");
+        }
+
+        let base = std::env::temp_dir().join("dirlook_splice_test");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("sub")).unwrap();
+        fs::write(base.join("a.bin"), vec![0u8; 1000]).unwrap();
+
+        let live = bootstrap(base.clone());
+        wait_known(&live.root);
+
+        // A shadow scan of an unchanged tree must be a no-op.
+        let shadow = bootstrap_n(base.clone(), 1);
+        wait_known(&shadow.root);
+        assert!(!splice(&live.index, &live.root, &shadow.root));
+        drop(shadow);
+
+        // Add a file; the rescanned shadow must be swapped in.
+        fs::write(base.join("b.bin"), vec![0u8; 500]).unwrap();
+        let shadow = bootstrap_n(base.clone(), 1);
+        wait_known(&shadow.root);
+        assert!(splice(&live.index, &live.root, &shadow.root));
+
+        assert_eq!(live.root.size(), 1500);
+        let b = live.root.path.join("b.bin");
+        assert!(live.root.child_list().iter().any(|c| c.path == b));
+        assert!(live.index.lock().unwrap().contains_key(&b));
+
+        drop(live);
+        drop(shadow);
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[cfg(unix)]

@@ -1,8 +1,9 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::sync::{mpsc, Arc};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::color;
@@ -13,6 +14,32 @@ use crate::treemap::{self, MapEntry};
 
 /// Children count up to which the map is laid out synchronously (instant).
 const SYNC_LIMIT: usize = 512;
+
+/// How often the background auto-refresh is scheduled.
+const WATCH_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Outer padding of the main view, in cells/rows.
+pub const MARGIN_X: usize = 2;
+pub const MARGIN_TOP: usize = 1;
+pub const MARGIN_BOTTOM: usize = 1;
+
+/// A background re-scan of one folder, built in a detached tree so the live view
+/// is untouched until the finished result is swapped in.
+struct RefreshJob {
+    focus: PathBuf,
+    rx: Receiver<Engine>,
+    cancel: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for RefreshJob {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SortMode {
@@ -97,11 +124,17 @@ pub struct App {
     pub sort: SortMode,
     pub quit: bool,
     pub cell_width: u32,
-    pub show_legend: bool,
+    pub show_help: bool,
     pub tick: u64,
     pub layout: LayoutMode,
     pub split_v: usize,
     pub split_h: usize,
+
+    pub watch: bool,
+    last_watch: Instant,
+    refresh_started: Instant,
+    refresh_took: Duration,
+    refresh_job: Option<RefreshJob>,
 
     map_tx: Sender<MapRequest>,
     map_rx: Receiver<MapResult>,
@@ -151,11 +184,16 @@ impl App {
             sort: SortMode::Name,
             quit: false,
             cell_width: 1,
-            show_legend: false,
+            show_help: false,
             tick: 0,
             layout: LayoutMode::Vertical,
             split_v: 30,
             split_h: 40,
+            watch: false,
+            last_watch: Instant::now(),
+            refresh_started: Instant::now(),
+            refresh_took: Duration::ZERO,
+            refresh_job: None,
             map_tx,
             map_rx,
             map_gen: 0,
@@ -211,6 +249,28 @@ impl App {
         self.subject_node()
     }
 
+    /// Size of the directory that contains the selected row — the denominator
+    /// for the "share of" figure in the status bar. `None` when the parent is
+    /// unknown (e.g. the scan root, or before its size is in).
+    pub fn selected_parent_size(&self) -> Option<u64> {
+        let row = self.visible.get(self.selected)?;
+        if row.is_parent {
+            return None;
+        }
+        let node = self.node_by_path(&row.path)?;
+        let parent = node
+            .parent
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|w| w.upgrade())?;
+        if parent.is_known() {
+            Some(parent.size())
+        } else {
+            None
+        }
+    }
+
     pub fn highlight_path(&self) -> Option<PathBuf> {
         let row = self.visible.get(self.selected)?;
         if row.is_parent {
@@ -225,47 +285,54 @@ impl App {
     /// Kept in one place so `ui::render` and the off-thread map builder in
     /// `pump` always agree on the map's dimensions.
     pub fn regions(&self, rows: usize, cols: usize) -> Regions {
+        let mx = MARGIN_X.min(cols.saturating_sub(1) / 2);
+        let inner_x = mx;
+        let inner_w = cols.saturating_sub(mx * 2).max(1);
+        let content_top = MARGIN_TOP.min(rows.saturating_sub(1)) + 1;
+        let content_bottom = rows.saturating_sub(1 + MARGIN_BOTTOM);
+        let content_h = content_bottom.saturating_sub(content_top).max(1);
+
         match self.layout {
             LayoutMode::Vertical => {
-                let content_h = rows.saturating_sub(2);
-                let max_tree = cols.saturating_sub(2).max(1);
-                let tree_w = (cols * self.split_v / 100).clamp(1, max_tree);
-                let map_x = tree_w + 1;
-                let map_w = cols.saturating_sub(map_x);
+                let max_tree = inner_w.saturating_sub(2).max(1);
+                let tree_w = (inner_w * self.split_v / 100).clamp(1, max_tree);
+                let map_x = inner_x + tree_w + 1;
+                let map_w = (inner_x + inner_w).saturating_sub(map_x);
                 Regions {
                     mode: LayoutMode::Vertical,
                     tree: Rect {
-                        x: 0,
-                        y: 1,
+                        x: inner_x,
+                        y: content_top,
                         w: tree_w,
                         h: content_h,
                     },
                     map: Rect {
                         x: map_x,
-                        y: 1,
+                        y: content_top,
                         w: map_w,
                         h: content_h,
                     },
-                    divider: Divider::Vertical(tree_w),
+                    divider: Divider::Vertical(inner_x + tree_w),
                 }
             }
             LayoutMode::Horizontal => {
-                let content_h = rows.saturating_sub(3);
-                let tree_h = (content_h * self.split_h / 100).max(2);
-                let map_h = content_h.saturating_sub(tree_h);
-                let sep_row = 1 + tree_h;
+                let tree_h = ((content_h * self.split_h / 100).max(2))
+                    .min(content_h.saturating_sub(1))
+                    .max(1);
+                let map_h = content_h.saturating_sub(tree_h + 1);
+                let sep_row = content_top + tree_h;
                 Regions {
                     mode: LayoutMode::Horizontal,
                     tree: Rect {
-                        x: 0,
-                        y: 1,
-                        w: cols,
+                        x: inner_x,
+                        y: content_top,
+                        w: inner_w,
                         h: tree_h,
                     },
                     map: Rect {
-                        x: 0,
+                        x: inner_x,
                         y: sep_row + 1,
-                        w: cols,
+                        w: inner_w,
                         h: map_h,
                     },
                     divider: Divider::Horizontal(sep_row),
@@ -293,8 +360,10 @@ impl App {
     pub fn handle_key(&mut self, code: KeyCode) {
         match code {
             KeyCode::Char('q') => self.quit = true,
-            KeyCode::Char('/') | KeyCode::Char('?') => self.show_legend = !self.show_legend,
-            KeyCode::Escape => self.show_legend = false,
+            KeyCode::Char('/') | KeyCode::Char('?') => self.show_help = !self.show_help,
+            KeyCode::Escape => self.show_help = false,
+            KeyCode::Char('r') => self.start_refresh(),
+            KeyCode::Char('w') => self.watch = !self.watch,
             KeyCode::Down | KeyCode::Char('j') => {
                 if !self.visible.is_empty() && self.selected < self.visible.len() - 1 {
                     self.selected += 1;
@@ -371,7 +440,47 @@ impl App {
         }
     }
 
+    /// Drop any in-flight background refresh (used when the focus moves).
+    fn cancel_refresh(&mut self) {
+        self.refresh_job = None;
+        self.last_watch = Instant::now();
+    }
+
+    /// Kick off a background re-scan of the focused folder (key `r` or auto).
+    fn start_refresh(&mut self) {
+        if self.refresh_job.is_some() {
+            return;
+        }
+        let focus = self.focus.clone();
+        let (tx, rx) = mpsc::channel::<Engine>();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&cancel);
+        let path = focus.clone();
+        let handle = thread::spawn(move || {
+            let engine = scanner::bootstrap_n(path, 2);
+            let root = Arc::clone(&engine.root);
+            while !root.is_known() {
+                if flag.load(Ordering::Relaxed) {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(2));
+            }
+            if flag.load(Ordering::Relaxed) {
+                return;
+            }
+            let _ = tx.send(engine);
+        });
+        self.refresh_job = Some(RefreshJob {
+            focus,
+            rx,
+            cancel,
+            handle: Some(handle),
+        });
+        self.refresh_started = Instant::now();
+    }
+
     fn enter_dir(&mut self, path: &std::path::Path) {
+        self.cancel_refresh();
         self.focus = path.to_path_buf();
         self.expanded.insert(path.to_path_buf());
         self.boost_focus();
@@ -391,6 +500,7 @@ impl App {
             }
         } else if let Some(parent) = self.focus.parent().map(|p| p.to_path_buf()) {
             let from = self.focus.clone();
+            self.cancel_refresh();
             self.focus = parent;
             self.boost_focus();
             self.refresh();
@@ -416,6 +526,7 @@ impl App {
         self.map_layout = None;
         self.map_key = None;
         self.map_cache.clear();
+        self.cancel_refresh();
         self.refresh();
     }
 
@@ -525,9 +636,62 @@ impl App {
         }
     }
 
+    /// Poll the background refresh; swap in the result when it is ready, and
+    /// schedule the next auto-refresh.
+    fn pump_refresh(&mut self) {
+        if let Some(job) = self.refresh_job.take() {
+            match job.rx.try_recv() {
+                Ok(engine) => {
+                    self.refresh_took = self.refresh_started.elapsed();
+                    self.last_watch = Instant::now();
+                    self.apply_shadow(&job.focus, engine);
+                }
+                Err(TryRecvError::Empty) => self.refresh_job = Some(job),
+                Err(TryRecvError::Disconnected) => {
+                    self.refresh_took = self.refresh_started.elapsed();
+                    self.last_watch = Instant::now();
+                }
+            }
+        }
+
+        // A slow scan naturally backs off: the next check waits at least as long
+        // as the scan took, on top of the base interval.
+        let interval = WATCH_INTERVAL.max(self.refresh_took);
+        let root_known = self.root.as_ref().map(|r| r.is_known()).unwrap_or(false);
+        if self.watch
+            && self.refresh_job.is_none()
+            && root_known
+            && self.last_watch.elapsed() >= interval
+        {
+            self.start_refresh();
+        }
+    }
+
+    /// Swap a finished shadow scan into the live tree. The tree and the map both
+    /// change in this one frame, or not at all.
+    fn apply_shadow(&mut self, focus: &std::path::Path, engine: Engine) {
+        let Some(live) = self.node_by_path(focus) else {
+            return;
+        };
+        if !live.is_dir {
+            return;
+        }
+        let sel = self.visible.get(self.selected).map(|r| r.path.clone());
+        if scanner::splice(&self.index, &live, &engine.root) {
+            self.refresh();
+            self.force_map_rebuild();
+            if let Some(p) = sel {
+                if let Some(i) = self.visible.iter().position(|r| r.path == p) {
+                    self.selected = i;
+                }
+            }
+        }
+    }
+
     /// Rebuild visible rows and drive the asynchronous, cached treemap build.
     pub fn pump(&mut self) {
         self.refresh();
+        self.pump_refresh();
 
         loop {
             match self.map_rx.try_recv() {

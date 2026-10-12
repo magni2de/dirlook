@@ -199,8 +199,12 @@ pub fn draw(screen: &mut Screen, ox: usize, oy: usize, w: usize, h: usize, layou
                     let name = width::truncate(&b.label, tw);
                     screen.put_str(tx, ty, &name, fg_name, b.color);
                     if th >= 2 {
+                        // Only show the size when it fully fits the block; a
+                        // truncated number ("1023…") would be misleading.
                         let sz = color::human_size(b.size);
-                        screen.put_str(tx, ty + 1, &sz, fg_size, b.color);
+                        if width::str_width(&sz) <= tw {
+                            screen.put_str(tx, ty + 1, &sz, fg_size, b.color);
+                        }
                     }
                 }
             }

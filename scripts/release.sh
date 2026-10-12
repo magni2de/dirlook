@@ -93,6 +93,16 @@ BRANCH="$(git rev-parse --abbrev-ref HEAD)"
 [ -z "$(git status --porcelain)" ] || die "working tree is dirty; commit or stash first"
 git rev-parse -q --verify "refs/tags/$TAG" >/dev/null && die "tag $TAG already exists"
 
+# AGENTS.md is for agents only and must never be published. It is git-ignored
+# and excluded from the crate; fail loudly if either guard slips.
+if git ls-files --error-unmatch AGENTS.md >/dev/null 2>&1; then
+  die "AGENTS.md is tracked by git; it would go public. Fix: git rm --cached AGENTS.md"
+fi
+if cargo package --list --allow-dirty 2>/dev/null | grep -qx "AGENTS.md"; then
+  die "AGENTS.md is included in the cargo package; add it to 'exclude' in Cargo.toml"
+fi
+echo "AGENTS.md: not tracked and not packaged (ok)"
+
 OLD="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/^version = "([^"]+)".*/\1/')"
 [ -n "$OLD" ] || die "could not read the current version from Cargo.toml"
 [ "$OLD" != "$VERSION" ] || die "version is already $VERSION"
